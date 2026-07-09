@@ -6,7 +6,7 @@ Yo simplemente implementé transformaciones multiescala basadas en wavelets
 insertadas antes del patch embedding del encoder. Las variantes:
 
 - **Starlet** (à trous): descomposición isotrópica, `C*(L+1)` canales.
-- **SWT** (stationary wavelet transform): 3 orientaciones por nivel + LL, comprimidas vía `channel_proj` 1×1.
+- **SWT** (stationary wavelet transform): 3 orientaciones por nivel + LL.
 - **WaveViT**: DWT de Haar dentro de los bloques de attention (compresión de K/V 4×).
 
 Todo el resto (training loop, JEPA, solver CEM, evaluación) es del repo original.

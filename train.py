@@ -6,12 +6,13 @@ import hydra
 import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
+import stable_worldmodel.data.formats.hdf5  # registra el formato HDF5
 import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from module import SIGReg
-from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
+from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback, StarletVisCallback
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -41,6 +42,9 @@ def lejepa_forward(self, batch, stage, cfg):
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'level_weights'):
+        for i, w in enumerate(self.model.encoder.level_weights):
+            losses_dict[f"{stage}/level_weight_{i}"] = w.detach()
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
 
@@ -52,6 +56,7 @@ def run(cfg):
 
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop("name")
+    fraction = dataset_cfg.pop("fraction", 1.0)
     cache_dir = os.environ.get("LOCAL_DATASET_DIR", None)
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
@@ -69,6 +74,21 @@ def run(cfg):
 
     transform = spt.data.transforms.Compose(*transforms)
     dataset.transform = transform
+
+    # Grab one sample frame for starlet visualization
+    sample_frame = None
+    if cfg.model.encoder._target_ == "wavelet.starlet_encoder.StarletEncoder":
+        for i in range(min(100, len(dataset))):
+            try:
+                row = dataset.get_row_data(i)
+                sample_frame = row["pixels"].unsqueeze(0)  # (1, 3, H, W)
+                break
+            except Exception:
+                continue
+
+    if fraction < 1.0:
+        n = int(len(dataset) * fraction)
+        dataset = torch.utils.data.Subset(dataset, range(n))
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(
@@ -121,9 +141,17 @@ def run(cfg):
         run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1,
     )
 
+    callbacks = [object_dump_callback]
+    if sample_frame is not None:
+        callbacks.append(StarletVisCallback(
+            run_dir=run_dir,
+            sample_frame=sample_frame,
+            levels=cfg.model.encoder.get("levels", 4),
+        ))
+
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[object_dump_callback],
+        callbacks=callbacks,
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,

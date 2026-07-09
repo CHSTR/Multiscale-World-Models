@@ -1,5 +1,3 @@
-"""Starlet wrapper: decompose images, stack coefficients as channels, feed ViT."""
-
 import torch
 from torch import nn
 
@@ -8,12 +6,6 @@ from .starlet_torch import starlet_conv4d
 
 class StarletEncoder(nn.Module):
     """Frontend that replaces RGB with (levels+1)×RGB wavelet coefficients.
-
-    pixel_values : (B, 3, H, W) ──→ ViT sees (B, 3·(levels+1), H, W).
-    The patch-embedding Conv2d is replaced so the channel count matches.
-
-    ``level_weights`` is a scalar per decomposition level (init 1).
-    If ``learnable_weights=True`` (default) the model can tune them via backprop.
     """
 
     def __init__(self, vit, levels: int = 4, filter: str = "b3",
@@ -28,7 +20,6 @@ class StarletEncoder(nn.Module):
             self.register_buffer("level_weights", w)
         self.vit = vit
 
-        # Replace the first conv with one that accepts starlet channels
         old_pe = vit.embeddings.patch_embeddings.projection
         new_in_c = old_pe.in_channels * (levels + 1)
         vit.embeddings.patch_embeddings.projection = nn.Conv2d(
@@ -40,9 +31,6 @@ class StarletEncoder(nn.Module):
             bias=old_pe.bias is not None,
         )
 
-        # Copy old weights into the first 3 channels so it starts from a
-        # valid ViT-tiny init (ponytail: lazy reuse, works because starlet
-        # level sums back to the original image).
         vit.config.num_channels = new_in_c
         vit.embeddings.patch_embeddings.num_channels = new_in_c
         with torch.no_grad():

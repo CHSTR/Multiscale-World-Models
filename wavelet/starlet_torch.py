@@ -1,12 +1,8 @@
-"""PyTorch à trous decomposition on GPU."""
-
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-# Available scaling-function filters for the à trous decomposition.
-# Keys: short name, Values: filter taps (sum = 1 for partition of unity).
 FILTERS: dict[str, list[float]] = {
     "haar": [0.5, 0.5],
     "b3":   [1/16, 1/4, 3/8, 1/4, 1/16],
@@ -53,7 +49,7 @@ def starlet_conv4d(
 
     for lv in range(1, levels + 1):
         dist = 2 ** (lv - 1)
-        # Build explicit dilated kernel: [0.5, 0,...,0, 0.5]
+        
         k_len = 1 + (len(lp) - 1) * dist
         kern = torch.zeros(k_len, dtype=x.dtype, device=x.device)
         for i, v in enumerate(lp):
@@ -62,7 +58,6 @@ def starlet_conv4d(
         kh = kern.view(1, 1, -1, 1).repeat(x.size(1), 1, 1, 1)
         kw = kern.view(1, 1, 1, -1).repeat(x.size(1), 1, 1, 1)
 
-        # conv output len = input + pad_total - k + 1. Need len unchanged → pad_total = k-1.
         pl = (k_len - 1) // 2
         pr = (k_len - 1) - pl
         # a = nn.functional.pad(approx, (pl, pr, pl, pr))

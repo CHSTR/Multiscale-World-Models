@@ -1,5 +1,3 @@
-"""PyTorch SWT (à trous) no diezmada en GPU."""
-
 from __future__ import annotations
 
 import torch
@@ -9,7 +7,7 @@ import torch.nn as nn
 FILTERS_LH: dict[str, tuple[list[float], list[float]]] = {
     "haar": ([0.70710678, 0.70710678],
              [0.70710678, -0.70710678]),
-    # CDF 5/3 (bior2.2), simétrico → coherente con el B3 simétrico del starlet
+    # CDF 5/3 (bior2.2)
     "bior2.2": ([-0.125, 0.25, 0.75, 0.25, -0.125],
                 [-0.5, 1.0, -0.5]),
 }
@@ -40,7 +38,7 @@ def swt_conv4d(x: torch.Tensor, levels: int, scale: torch.Tensor | None = None, 
 
     Devuelve (B, C*(3*levels+1), H, W): por nivel, 3 detalles orientados
     (LH, HL, HH) + la aproximación final, apilados en canales.
-    Misma interfaz que starlet_conv4d. OJO: NO es aditiva (no la valides con la suma).
+    Misma interfaz que starlet_conv4d.
     """
     C = x.size(1)
     lo, hi = FILTERS_LH[filter]
@@ -68,15 +66,13 @@ def swt_conv4d(x: torch.Tensor, levels: int, scale: torch.Tensor | None = None, 
 
 
 if __name__ == "__main__":
-    # ponytail: chequeo mínimo — forma, backward, cuenta de bandas.
-    # No chequeamos aditividad (la SWT no la cumple).
     for fname in FILTERS_LH:
         for ch in (3, 1):
             x = torch.randn(2, ch, 64, 64, requires_grad=True)
             c = swt_conv4d(x, levels=4, filter=fname)
             loss = c.pow(2).mean()
             loss.backward()
-            expected = ch * (3 * 4 + 1)  # 3*levels+1 bandas por canal
+            expected = ch * (3 * 4 + 1)
             assert c.shape == (2, expected, 64, 64), f"{fname}: {c.shape} != {(2, expected, 64, 64)}"
             assert x.grad is not None
             print(f"[ok] {fname} C={ch}: {tuple(x.shape)} → {tuple(c.shape)}, grad OK")

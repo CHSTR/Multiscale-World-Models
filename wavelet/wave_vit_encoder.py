@@ -1,4 +1,3 @@
-"""ViT encoder con bloques WaveletAttention para JEPA."""
 from dataclasses import dataclass
 
 import sys

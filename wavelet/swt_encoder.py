@@ -1,5 +1,3 @@
-"""SWT wrapper: descompone imágenes, apila coeficientes orientados como canales, feed ViT."""
-
 from torch import nn
 
 from .swt_torch import swt_conv4d
@@ -8,11 +6,7 @@ from .swt_torch import swt_conv4d
 class SWTEncoder(nn.Module):
     """Frontend que reemplaza RGB con coeficientes wavelet orientados SWT.
 
-    pixel_values : (B, 3, H, W) → SWT produce (B, 3·(3*levels+1), H, W) →
-    proyección 1×1 aprendible comprime a (B, 3·(levels+1), H, W) → ViT ve esa.
-
-    La proyección colapsa las 3 orientaciones por nivel (LH/HL/HH) a una banda,
-    manteniendo el mismo canalaje que StarletEncoder para comparar justo.
+    pixel_values : (B, 3, H, W) → SWT produce (B, 3·(3*levels+1), H, W)
     """
 
     def __init__(self, vit, levels: int = 4, filter: str = "bior2.2"):

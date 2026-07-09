@@ -15,14 +15,14 @@ embed_dim: 192
 history_size: 3
 
 trainer:
-  max_epochs: 100
+  max_epochs: 10
   devices: auto
   accelerator: gpu
   precision: bf16
   gradient_clip_val: 1.0
 
 loader:
-  batch_size: 128
+  batch_size: 128 #192
   num_workers: ${num_workers}
   persistent_workers: True
   prefetch_factor: 3
@@ -41,3 +41,8 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+
+wandb:
+  config:
+    entity: le-wm
+    project: le-wm

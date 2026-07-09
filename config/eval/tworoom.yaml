@@ -9,7 +9,7 @@ world:
   max_episode_steps: ??? # make sure it's >= eval_budget
 
 seed: 42
-policy: random # ckpt name or random
+policy: /home/chr/le-wm/dataset/checkpoints/lewm/weights_epoch_10.pt #random # ckpt name or random
 
 dataset:
   stats: ${eval.dataset_name}
@@ -28,7 +28,7 @@ eval:
   goal_offset_steps: 25
   eval_budget: 50
   img_size: 224
-  dataset_name: tworoom
+  dataset_name: tworoom.h5
   callables:
     # -- set state
     - method: _set_state

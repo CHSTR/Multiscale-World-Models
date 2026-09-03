@@ -109,16 +109,23 @@ fi
 # shellcheck disable=SC1091
 source "$ROOT/.venv/bin/activate"
 
-# 3. Dependencias (torch primero con su índice, resto de PyPI).
+# 3. Dependencias (resto de PyPI; el par torch/torchvision se fija después).
 #    stable-worldmodel[train,env] arrastra stable-pretraining, lightning, hydra.
 if [[ ! -f "$ROOT/.venv/.setup_done" ]] || (( FORCE )); then
-  uv pip install --index-url "$TORCH_URL" torch
   uv pip install "stable-worldmodel[train,env]" einops wandb huggingface_hub
   touch "$ROOT/.venv/.setup_done"
 else
   echo "deps ya instaladas (usa --force para reinstalar)"
 fi
-python -c "import torch; print('torch', torch.__version__, 'cuda_ok=', torch.cuda.is_available())"
+# Parche crítico (se verifica SIEMPRE, auto-repara venvs rotos sin --force):
+# torch y torchvision deben ser matched pair del MISMO índice. Si torchvision
+# viene de PyPI y torch del índice CUDA (o viceversa), `import torchvision`
+# falla con "operator torchvision::nms does not exist".
+if ! python -c "import torch, torchvision; torchvision.ops.nms(torch.rand(2,4), torch.rand(2), 0.5)" >/dev/null 2>&1; then
+  echo "reparando pair torch/torchvision desde $TORCH_URL ..."
+  uv pip install --index-url "$TORCH_URL" --force-reinstall --no-deps torch torchvision
+fi
+python -c "import torch, torchvision, torchmetrics, lightning; print('stack OK torch', torch.__version__, 'cuda_ok=', torch.cuda.is_available())"
 
 # 4. Datos (flujo original: HF collection + tar --zstd -> $STABLEWM_HOME).
 #    Nombres literales de este fork, tal cual están en config/train/data/:

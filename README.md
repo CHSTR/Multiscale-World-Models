@@ -25,16 +25,16 @@ Instrucciones de instalación y configuración del entorno en el [repo original]
 source .venv/bin/activate
 
 # ViT plano (baseline)
-python train.py dataset=tworoom model=lewm
+python train.py data=tworoom model=lewm
 
 # Starlet (L niveles)
-python train.py dataset=tworoom model=starlet model.encoder.levels=4
+python train.py data=tworoom model=starlet model.encoder.levels=4
 
 # SWT (L niveles)
-python train.py dataset=pusht model=swt model.encoder.levels=4
+python train.py data=pusht model=swt model.encoder.levels=4
 
 # WaveViT
-python train.py dataset=tworoom model=wave_vit
+python train.py data=tworoom model=wave_vit
 ```
 
 Los checkpoints se guardan en `dataset/checkpoints/<output_model_name>/`.

@@ -25,18 +25,18 @@ para el WM de `two-room`:
 ## Comandos
 ```
 # baseline ViT desde 0
-python train.py dataset=tworoom model=lewm
+python train.py data=tworoom model=lewm
 
-# DINO con LoRA (comparación directa)
-python train.py model=dinov2_lora
-python train.py model=dinov3_lora
+# DINO con LoRA (comparación directa, mismo dataset que el baseline)
+python train.py data=tworoom model=dinov2_lora
+python train.py data=tworoom model=dinov3_lora
 
 # variantes starlet / multicanal
-python train.py model=dinov2_starlet_lora
-python train.py model=dinov3_starlet_lora
+python train.py data=tworoom model=dinov2_starlet_lora
+python train.py data=tworoom model=dinov3_starlet_lora
 
 # overrides útiles
-python train.py model=dinov2_lora model.encoder.ckpt_path=... lora_r=8
+python train.py data=tworoom model=dinov2_lora model.encoder.ckpt_path=... lora_r=8
 ```
 
 ## Notas / decisiones

@@ -241,16 +241,16 @@ if [[ "$WANDB_MODE_ARG" == "offline" ]]; then export WANDB_MODE=offline; fi
 run() { echo "+ $*"; "$@"; }
 case "$TRAIN" in
   none) echo "train omitido";;
-  smoke) run python train.py dataset=tworoom model=lewm trainer.max_epochs=1;;
-  baseline) run python train.py dataset=tworoom model=lewm;;
+  smoke) run python train.py data=tworoom model=lewm trainer.max_epochs=1;;
+  baseline) run python train.py data=tworoom model=lewm;;
   dino)
-    run python train.py dataset=tworoom model=dinov2_lora "model.encoder.ckpt_path=null"
-    run python train.py dataset=tworoom model=dinov3_lora "model.encoder.ckpt_path=$DINOV3_CKPT"
+    run python train.py data=tworoom model=dinov2_lora "model.encoder.ckpt_path=null"
+    run python train.py data=tworoom model=dinov3_lora "model.encoder.ckpt_path=$DINOV3_CKPT"
     ;;
   all)
-    run python train.py dataset=tworoom model=lewm
-    run python train.py dataset=tworoom model=dinov2_lora "model.encoder.ckpt_path=null"
-    run python train.py dataset=tworoom model=dinov3_lora "model.encoder.ckpt_path=$DINOV3_CKPT"
+    run python train.py data=tworoom model=lewm
+    run python train.py data=tworoom model=dinov2_lora "model.encoder.ckpt_path=null"
+    run python train.py data=tworoom model=dinov3_lora "model.encoder.ckpt_path=$DINOV3_CKPT"
     ;;
   *) echo "TRAIN inválido: $TRAIN"; exit 1;;
 esac

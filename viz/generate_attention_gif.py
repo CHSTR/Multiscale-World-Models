@@ -1,8 +1,10 @@
 import argparse
 import json
+import math
 import os
 import sys
 
+import hydra.utils
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -109,10 +111,229 @@ def load_encoder(ckpt_path: str):
     if "WaveViTEncoder" in target:
         model = _load_wave_encoder(enc_cfg, ckpt_path)
         model._encoder_kind = "wave"
+    elif "DinoV2Encoder" in target or "DinoV3Encoder" in target:
+        model = _load_dino_encoder(enc_cfg, ckpt_path)
+        model._encoder_kind = "dino"
     else:
         model = _load_hf_encoder(enc_cfg, ckpt_path)
         model._encoder_kind = "hf"
     return model
+
+
+# ---- DINO (v2/v3 + LoRA + starlet interno): carga y captura de atencion ----
+# El wrapper (DinoV2Encoder/DinoV3Encoder) ya aplica starlet_conv4d en forward
+# cuando starlet_levels>0, asi que siempre se le da RGB. El ckpt guarda el
+# state_dict del JEPA -> se quita el prefijo "encoder.".
+def _load_dino_encoder(enc_cfg, ckpt_path):
+    target = enc_cfg.get("_target_", "")
+    cls = hydra.utils.get_class(target)
+    kwargs = {k: v for k, v in enc_cfg.items() if k != "_target_"}
+    # Sin pesos oficiales: construimos la arquitectura y cargamos el ckpt.
+    # (pretrained=False evita descargas; ckpt_path=null no dispara el hub.)
+    kwargs["pretrained"] = False
+    kwargs["ckpt_path"] = None
+    model = cls(**kwargs)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    prefix = "encoder."
+    mapped = {k[len(prefix):]: v for k, v in ckpt.items() if k.startswith(prefix)}
+    missing, unexpected = model.load_state_dict(mapped, strict=False)
+    print(f"Keys cargados: {len(mapped)} (DINO {target.rsplit('.', 1)[-1]}), "
+          f"missing={len(missing)}, unexpected={len(unexpected)}")
+    if missing:
+        print(f"  missing: {missing}")
+    if unexpected:
+        print(f"  unexpected: {unexpected}")
+    model.eval()
+    model._dino_target = target
+    model._is_dinov3 = "DinoV3Encoder" in target
+    return model
+
+
+def _effective_linear_weight(m):
+    """W efectivo de un Linear, sumando el delta LoRA si existe (eval).
+
+    En forward el delta es (x @ A @ B) con A:(in,r), B:(r,out); para sumarlo
+    al weight (out,in) hay que transponerlo.
+    """
+    w = m.weight.detach()
+    if hasattr(m, "lora_A"):
+        w = w + (m.lora_A.detach() @ m.lora_B.detach()).T * float(m.lora_scale)
+    return w
+
+
+def _iter_dino_attn(backbone):
+    """Yieldea los modulos de atencion de cada bloque, en orden."""
+    for blk in backbone.blocks:
+        attn = getattr(blk, "attn", None)
+        if attn is None:
+            # BlockChunk u otro contenedor: baja un nivel.
+            for sub in blk.children():
+                attn = getattr(sub, "attn", None)
+                if attn is not None:
+                    yield attn
+        else:
+            yield attn
+
+
+def dino_forward_features(wrapper, frame_np, dev):
+    """Forward RGB + captura por hooks.
+
+    Returns:
+        attns: lista por capa de (h, N, N) numpy (solo DINOv2; [] en v3).
+        hidden_last: (1+N, D) numpy del ultimo layer (CLS primero).
+        psize: lado del grid de parches. n_patches: N-1 (v2) o N-1-storage (v3).
+    """
+    backbone = wrapper.model
+    attn_mods = list(_iter_dino_attn(backbone))
+    saved = {}
+    hooks = []
+    for i, mod in enumerate(attn_mods):
+        hooks.append(mod.register_forward_hook(
+            lambda m, inp, out, _i=i: saved.__setitem__(_i, inp[0].detach())))
+    try:
+        x = ToTensor()(Image.fromarray(frame_np)).unsqueeze(0).to(dev)
+        with torch.no_grad():
+            out = wrapper(x)
+    finally:
+        for h in hooks:
+            h.remove()
+
+    hidden_last = out.last_hidden_state[0].cpu().numpy()  # (1+N, D)
+    is_v3 = getattr(wrapper, "_is_dinov3", False)
+    n_storage = 0
+    attns = []
+    if not is_v3:
+        for i, mod in enumerate(attn_mods):
+            x_in = saved[i].float()
+            w_eff = _effective_linear_weight(mod.qkv).float()
+            b = mod.qkv.bias.float() if mod.qkv.bias is not None else None
+            B, N, _ = x_in.shape
+            h = mod.num_heads
+            d = w_eff.shape[0] // 3 // h
+            qkv = F.linear(x_in, w_eff, b).reshape(B, N, 3, h, d).permute(2, 0, 3, 1, 4)
+            q, k = qkv[0] * mod.scale, qkv[1]
+            attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)  # (B, h, N, N)
+            attns.append(attn[0].cpu().numpy())
+    else:
+        n_storage = int(getattr(backbone, "n_storage_tokens", 0) or 0)
+
+    n_patches = hidden_last.shape[0] - 1 - n_storage
+    psize = int(math.sqrt(n_patches))
+    assert psize * psize == n_patches, f"grid no cuadrado: N={n_patches}"
+    return attns, hidden_last, psize, n_storage
+
+
+def _blend(frame_np, norm):
+    cmap = plt.get_cmap("magma_r")(norm)[:, :, :3]
+    img_f = frame_np.astype(np.float64) / 255.0
+    blended = np.clip(img_f * 0.35 + cmap * 0.65, 0, 1)
+    return (blended * 255).astype(np.uint8)
+
+
+def _upsample_grid(g, h):
+    norm = (g - g.min()) / (g.max() - g.min() + 1e-8)
+    big = zoom_attn(norm, h / g.shape[0], order=1)
+    return np.clip(big, 0, 1)
+
+
+def dino_attn_map(attns, psize, h, layer=-1, head=-1, aggregation="capa"):
+    """Heatmap CLS->parches desde attention explicita (DINOv2)."""
+    if aggregation == "global":
+        raw = np.stack([a[:, 0, 1:].mean(axis=0) for a in attns]).mean(axis=0)
+    elif aggregation == "head":
+        raw = np.stack([a[head, 0, 1:] for a in attns]).mean(axis=0)
+    else:
+        lid = layer if layer >= 0 else len(attns) - 1
+        a = attns[lid][:, 0, 1:]
+        raw = a[head] if head >= 0 else a.mean(axis=0)
+    return raw.reshape(psize, psize)
+
+
+def dino_heads_maps(attns, psize, layer=-1, aggregate_layers=False):
+    """Lista de heatmaps por cabeza (DINOv2)."""
+    if aggregate_layers:
+        raw = np.stack([a[:, 0, 1:] for a in attns]).mean(axis=0)  # (h, Np)
+    else:
+        lid = layer if layer >= 0 else len(attns) - 1
+        raw = attns[lid][:, 0, 1:]  # (h, Np)
+    return [g.reshape(psize, psize) for g in raw]
+
+
+def dino_cosine_map(hidden_last, psize, n_storage=0):
+    """Similitud coseno CLS->parches del ultimo layer (v2 y v3)."""
+    cls_vec = hidden_last[0]
+    patches = hidden_last[1 + n_storage:]
+    sim = (patches / (np.linalg.norm(patches, axis=-1, keepdims=True) + 1e-8)) @ (
+        cls_vec / (np.linalg.norm(cls_vec) + 1e-8))
+    return sim.reshape(psize, psize)
+
+
+def generate_gif_dino(wrapper, frames, output_path, fps=6, layer=-1, head=-1,
+                      aggregation="capa", dev="cpu"):
+    h = frames[0].shape[0]
+    frame_images = []
+    for i, frm in enumerate(frames):
+        print(f"Frame {i + 1}/{len(frames)}")
+        attns, _, psize, _ = dino_forward_features(wrapper, frm, dev)
+        raw = dino_attn_map(attns, psize, h, layer=layer, head=head, aggregation=aggregation)
+        heatmap = _blend(frm, _upsample_grid(raw, h))
+        frame_images.append(make_frame_image(frm, heatmap))
+    print("Armado GIF...")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    frame_images[0].save(output_path, save_all=True, append_images=frame_images[1:],
+                         duration=500, loop=0, optimize=False)
+    print(f"GIF guardado: {output_path}")
+
+
+def generate_heads_gif_dino(wrapper, frames, output_path, fps=6, layer=-1,
+                            goal_np=None, aggregate_layers=False, dev="cpu"):
+    frame_images = []
+    for i, frm in enumerate(frames):
+        print(f"Frame {i + 1}/{len(frames)}")
+        attns, _, psize, _ = dino_forward_features(wrapper, frm, dev)
+        raw_maps = dino_heads_maps(attns, psize, layer=layer, aggregate_layers=aggregate_layers)
+        h = frm.shape[0]
+        maps = [(plt.get_cmap("magma_r")(_upsample_grid(g, h))[:, :, :3] * 255).astype(np.uint8)
+                for g in raw_maps]
+        frame_images.append(make_heads_frame_image(frm, maps, goal_np))
+    print("Armado GIF...")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    frame_images[0].save(output_path, save_all=True, append_images=frame_images[1:],
+                         duration=500, loop=0, optimize=False)
+    print(f"GIF guardado: {output_path}")
+
+
+def generate_cosine_gif_dino(wrapper, frames, output_path, fps=6, dev="cpu"):
+    """GIF coseno CLS->parches (vale para v2 y v3; sin attention explicita)."""
+    h_orig = frames[0].shape[0]
+    pil_frames = []
+    for t, frame_np in enumerate(frames):
+        print(f"Frame {t + 1}/{len(frames)}")
+        _, hidden_last, psize, n_storage = dino_forward_features(wrapper, frame_np, dev)
+        raw = dino_cosine_map(hidden_last, psize, n_storage)
+        # reutiliza el render con colorbar del path HF
+        norm = (raw - raw.min()) / (raw.max() - raw.min() + 1e-8)
+        big = zoom_attn(norm, h_orig / psize, order=1)
+        cmap_arr = plt.get_cmap("RdYlBu_r")(big)[:, :, :3]
+        img_f = frame_np.astype(np.float64) / 255.0
+        blended = np.clip(img_f * 0.35 + cmap_arr * 0.65, 0, 1)
+        import io
+        fig, ax = plt.subplots(figsize=(0.5, h_orig / 72), dpi=72)
+        cb = matplotlib.colorbar.ColorbarBase(ax, cmap=plt.get_cmap("RdYlBu_r"),
+                                              orientation="vertical", ticks=[0, 0.5, 1])
+        cb.set_ticklabels(["Bajo", "Medio", "Alto"], fontsize=8)
+        cb.ax.yaxis.set_tick_params(pad=6)
+        cb.set_label("Similitud coseno CLS→parches", fontsize=7, labelpad=10)
+        fig.subplots_adjust(left=0.25, right=0.5, top=0.95, bottom=0.05)
+        fig.canvas.draw()
+        cbar = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+        plt.close(fig)
+        pad = np.zeros((h_orig, 20, 3), dtype=np.uint8) + 255
+        full = np.concatenate([(blended * 255).astype(np.uint8), pad, cbar], axis=1)
+        pil_frames.append(Image.fromarray(full))
+    pil_frames[0].save(output_path, save_all=True, append_images=pil_frames[1:],
+                       duration=1000 // fps, loop=0)
 
 
 def cosine_sim(cls_vec, patch_tokens):
@@ -284,15 +505,28 @@ def generate_cosine_gif(encoder, frames, psize, output_path, fps=6, layer=-1):
                         duration=1000 // fps, loop=0)
 
 
-def load_frames(n_frames=30, start_idx=0, dataset="tworoom"):
-    """Cargar frames contiguos del dataset (tworoom | pusht) usando dataset API con num_steps=1."""
+def load_frames(n_frames=30, start_idx=0, dataset="tworoom", frames_path=None):
+    """Cargar frames contiguos del dataset (tworoom | pusht) con num_steps=1.
+
+    Orden de resolucion: --frames-path explicito > legacy repo/dataset/datasets/
+    (si existe) > loader oficial con cache (STABLEWM_HOME/LOCAL_DATASET_DIR).
+    """
+    import stable_worldmodel
     import stable_worldmodel.data.formats.hdf5
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    h5path = {"tworoom": os.path.join(repo, "dataset/datasets/tworoom.h5"),
-              "pusht": os.path.join(repo, "dataset/datasets/pusht_expert_train.h5")}.get(dataset, dataset)
+    names = {"tworoom": "tworoom.h5", "pusht": "pusht_expert_train.lance"}
+    name = names.get(dataset, dataset)
+    if frames_path is not None:
+        src = frames_path
+    else:
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        legacy = os.path.join(repo, "dataset", "datasets", name)
+        src = legacy if os.path.exists(legacy) else name
+    cache_dir = os.environ.get("LOCAL_DATASET_DIR", os.environ.get("STABLEWM_HOME"))
     swm_dset = stable_worldmodel.data.load_dataset(
-        name=h5path, keys_to_load=["pixels"], num_steps=1, frameskip=1,
+        name=src, cache_dir=cache_dir, keys_to_load=["pixels"], num_steps=1, frameskip=1,
     )
+    if start_idx + n_frames > len(swm_dset):
+        raise ValueError(f"start={start_idx} + nframes={n_frames} excede len(dataset)={len(swm_dset)}")
     frames = []
     for i in range(n_frames):
         arr = swm_dset[start_idx + i]["pixels"]  # (1, C, H, W)
@@ -544,10 +778,12 @@ def main():
                         help="Promediar atencion sobre todas las capas (mode=heads)")
     parser.add_argument("--dataset", default="tworoom", choices=["tworoom", "pusht"],
                         help="Dataset de origen de los frames")
+    parser.add_argument("--frames-path", default=None,
+                        help="Ruta local al dataset (por defecto: resolucion por cache)")
     args = parser.parse_args()
 
-    if "LOCAL_DATASET_DIR" not in os.environ:
-        os.environ["LOCAL_DATASET_DIR"] = "/home/chr/.stable_worldmodel"
+    if "LOCAL_DATASET_DIR" not in os.environ and "STABLEWM_HOME" not in os.environ:
+        os.environ["LOCAL_DATASET_DIR"] = os.path.expanduser("~/.stable_worldmodel")
 
     print("Cargando modelo...")
     encoder = load_encoder(args.ckpt)
@@ -556,6 +792,13 @@ def main():
     print(f"Dispositivo: {dev}")
 
     is_wave = getattr(encoder, "_encoder_kind", "hf") == "wave"
+    is_dino = getattr(encoder, "_encoder_kind", "") == "dino"
+    is_dinov3 = is_dino and getattr(encoder, "_is_dinov3", False)
+
+    if is_dino:
+        # DINO: psize dinamico por forward (grid sqrt de parches); nada que precalcular.
+        psize, n_layers = None, len(list(encoder.model.blocks))
+        print(f"DINO ({'v3' if is_dinov3 else 'v2'}). layers={n_layers} (psize dinamico)")
 
     if is_wave:
         # ponytail: N_q = (224/14)^2 = 256, N_kv = N_q/4 = 64 -> grids 16x16 / 8x8
@@ -566,17 +809,38 @@ def main():
         n_heads = encoder.num_heads
         print(f"WaveViTEncoder. Patch grid Q: {psize_q}x{psize_q}, KV (wavelet): {psize_kv}x{psize_kv}, "
               f"layers={n_layers}, heads={n_heads}")
-    else:
+    elif not is_dino:
         # ponytail: psize desde config en vez de dummy forward
         psize = encoder.config.image_size // encoder.config.patch_size
         n_layers = encoder.config.num_hidden_layers
         print(f"HF ViT. Patch grid: {psize}x{psize}, layers={n_layers}")
 
     print("Cargando frames...")
-    frames = load_frames(n_frames=args.nframes, start_idx=args.start, dataset=args.dataset)
+    frames = load_frames(n_frames=args.nframes, start_idx=args.start,
+                         dataset=args.dataset, frames_path=args.frames_path)
     print(f"{len(frames)} frames cargados")
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if is_dino:
+        if is_dinov3 and args.mode != "cosine":
+            raise ValueError("DINOv3 solo soporta mode=cosine (RoPE impide recomputar "
+                             "attention exacta); usa --mode cosine.")
+        if args.mode == "cosine":
+            generate_cosine_gif_dino(encoder, frames, f"{args.output_dir}/cosine.gif", dev=dev)
+        elif args.mode == "heads":
+            goal_np = frames[-1]
+            layer_tag = f"layer{args.layer}" if not args.aggregate_layers else "agglayers"
+            generate_heads_gif_dino(encoder, frames,
+                                    f"{args.output_dir}/heads_{layer_tag}.gif",
+                                    layer=args.layer, goal_np=goal_np,
+                                    aggregate_layers=args.aggregate_layers, dev=dev)
+        else:
+            aggregation = {"capa": "capa", "head": "head", "global": "global"}[args.mode]
+            generate_gif_dino(encoder, frames, f"{args.output_dir}/attention_gif.gif",
+                              layer=args.layer, head=args.head,
+                              aggregation=aggregation, dev=dev)
+        return
 
     if args.mode == "cosine":
         lid = args.layer if args.layer >= 0 else n_layers - 1

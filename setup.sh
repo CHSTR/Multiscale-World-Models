@@ -7,8 +7,8 @@
 #   git clone https://github.com/galilai-group/stable-worldmodel
 #   uv pip install -e ".[all]"   (= train,env,format,data: trae hdf5plugin,
 #                                  stack lance, gymnasium[all] y pines compatibles)
-#   datos HDF5 de https://huggingface.co/collections/quentinll/lewm
-#   tar --zstd -xvf archive.tar.zst -> $STABLEWM_HOME (~/.stable-wm/)
+#   datos de https://huggingface.co/collections/quentinll/lewm
+#   (tar --zstd si aplica) -> $STABLEWM_HOME/datasets/ (layout que exige el loader)
 #
 # Uso:
 #   ./setup.sh [--python 3.10] [--torch auto|cu128|cu126|cu124|cu121|cu118|cpu]
@@ -157,13 +157,32 @@ if (( NEED_TORCH_FIX )); then
 fi
 python -c "import torch, torchvision, torchmetrics, lightning; print('stack OK torch', torch.__version__, 'cuda_ok=', torch.cuda.is_available())"
 
-# 4. Datos (flujo original: HF collection + tar --zstd -> $STABLEWM_HOME).
-#    Nombres literales de este fork, tal cual están en config/train/data/:
-#      tworoom.h5 , pusht_expert_train.lance (se dejan como están).
+# 4. Datos (HF collection quentinll/lewm).
+#    El loader actual (stable_worldmodel.data.load_dataset) resuelve nombres
+#    contra <cache>/datasets/ (cache = $LOCAL_DATASET_DIR o $STABLEWM_HOME):
+#    el nombre debe existir ahí como archivo o directorio. Los yamls de este
+#    fork usan nombres literales con extensión (tworoom.h5,
+#    pusht_expert_train.lance), así que se colocan TAL CUAL bajo datasets/.
 export STABLEWM_HOME="${STABLEWM_HOME:-$HOME/.stable-wm}"
 export LOCAL_DATASET_DIR="${LOCAL_DATASET_DIR:-$STABLEWM_HOME}"
-mkdir -p "$STABLEWM_HOME"
-echo "STABLEWM_HOME=$STABLEWM_HOME LOCAL_DATASET_DIR=$LOCAL_DATASET_DIR"
+DS_DIR="$LOCAL_DATASET_DIR/datasets"
+mkdir -p "$DS_DIR"
+echo "STABLEWM_HOME=$STABLEWM_HOME LOCAL_DATASET_DIR=$LOCAL_DATASET_DIR DS_DIR=$DS_DIR"
+
+place_dataset_files() { # $1 = dir descargado -> copia *.h5/*.lance a $DS_DIR
+  local src="$1" f
+  shopt -s nullglob
+  for pat in "$src"/*.h5 "$src"/*.hdf5 "$src"/*/*.h5 "$src"/*/*.hdf5; do
+    [[ -f "$pat" ]] || continue
+    cp -f "$pat" "$DS_DIR/" && echo "dataset: $DS_DIR/$(basename "$pat")"
+  done
+  for pat in "$src"/*.lance "$src"/*/*.lance; do
+    [[ -e "$pat" ]] || continue
+    rm -rf "$DS_DIR/$(basename "$pat")"
+    cp -r "$pat" "$DS_DIR/" && echo "dataset: $DS_DIR/$(basename "$pat")"
+  done
+  shopt -u nullglob
+}
 
 declare -A REPOS=( [tworoom]="quentinll/lewm-tworooms" [pusht]="quentinll/lewm-pusht"
                    [cube]="quentinll/lewm-cube" [reacher]="quentinll/lewm-reacher" )
@@ -176,33 +195,29 @@ esac
 for d in "${want[@]:-}"; do
   repo="${REPOS[$d]}"
   echo "--- dataset $d <- $repo ---"
-  if (( FORCE )) || ! ls "$STABLEWM_HOME" | grep -qi "$d"; then
-    hf download "$repo" --repo-type dataset --local-dir "$STABLEWM_HOME/$d" 2>/dev/null \
-      || huggingface-cli download "$repo" --repo-type dataset --local-dir "$STABLEWM_HOME/$d"
+  dl="$STABLEWM_HOME/_dl_$d"
+  if (( FORCE )) || ! ls "$DS_DIR" | grep -qi "$d"; then
+    mkdir -p "$dl"
+    hf download "$repo" --repo-type dataset --local-dir "$dl" 2>/dev/null \
+      || huggingface-cli download "$repo" --repo-type dataset --local-dir "$dl"
     # archives estilo original: tar --zstd -xvf archive.tar.zst
-    for a in "$STABLEWM_HOME/$d"/*.tar.zst "$STABLEWM_HOME"/*.tar.zst; do
+    for a in "$dl"/*.tar.zst; do
       [[ -f "$a" ]] || continue
       echo "extrayendo $a ..."
-      tar --zstd -xvf "$a" -C "$STABLEWM_HOME"
+      tar --zstd -xvf "$a" -C "$dl"
     done
-    # aplanar si hf creó subcarpeta por repo
-    shopt -s nullglob
-    for f in "$STABLEWM_HOME/$d"/*.h5 "$STABLEWM_HOME/$d"/*.lance; do
-      [[ -f "$STABLEWM_HOME/$(basename "$f")" ]] || cp -r "$f" "$STABLEWM_HOME/"
-    done
-    shopt -u nullglob
+    place_dataset_files "$dl"
   else
-    echo "dataset $d ya presente (usa --force para re-descargar)"
+    echo "dataset $d ya presente en $DS_DIR (usa --force para re-descargar)"
   fi
 done
-echo "contenido STABLEWM_HOME:"; ls "$STABLEWM_HOME" || true
-# verificación literal (nombres tal cual, sin normalizar)
-[[ "$DATA" == "none" ]] || true
+echo "contenido DS_DIR:"; ls "$DS_DIR" || true
+# verificación: los nombres que resuelve el loader (literales de los yamls)
 if [[ " ${want[*]} " == *"tworoom"* ]]; then
-  [[ -f "$STABLEWM_HOME/tworoom.h5" ]] && echo "OK tworoom.h5" || echo "AVISO: falta tworoom.h5 en $STABLEWM_HOME"
+  [[ -f "$DS_DIR/tworoom.h5" ]] && echo "OK datasets/tworoom.h5" || echo "AVISO: falta datasets/tworoom.h5 (name: tworoom.h5 no resolverá)"
 fi
 if [[ " ${want[*]} " == *"pusht"* ]]; then
-  [[ -e "$STABLEWM_HOME/pusht_expert_train.lance" ]] && echo "OK pusht_expert_train.lance" || echo "AVISO: falta pusht_expert_train.lance en $STABLEWM_HOME"
+  [[ -e "$DS_DIR/pusht_expert_train.lance" ]] && echo "OK datasets/pusht_expert_train.lance" || echo "AVISO: falta datasets/pusht_expert_train.lance (name: pusht_expert_train.lance no resolverá)"
 fi
 
 # 5. Pesos DINO (v2 por hub = auto ; v3 vía DINOV3_CKPT, sin tocar yamls).

@@ -81,7 +81,22 @@ case "$TORCH" in
   *) echo "TORCH inválido: $TORCH"; exit 1;;
 esac
 
-# 2. uv + venv (Python 3.10 como el original).
+# 2. Deps del sistema (solo lectura si ya están).
+#    box2d-py (vía gymnasium[all] <- stable-worldmodel[env]) compila con swig.
+if ! command -v swig >/dev/null 2>&1; then
+  echo "instalando swig del sistema (requerido por box2d-py)..."
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update && sudo apt-get install -y swig build-essential
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y swig gcc gcc-c++ make
+  elif command -v pacman >/dev/null 2>&1; then
+    sudo pacman -S --noconfirm swig base-devel
+  else
+    echo "AVISO: instala 'swig' a mano y re-ejecuta (sin swig falla box2d-py)."
+  fi
+fi
+
+# 3. uv + venv (Python 3.10 como el original).
 if ! command -v uv >/dev/null 2>&1; then
   echo "instalando uv..."
   curl -LsSf https://astral.sh/uv/install.sh | sh

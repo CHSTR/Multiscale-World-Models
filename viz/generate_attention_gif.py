@@ -150,18 +150,6 @@ def _load_dino_encoder(enc_cfg, ckpt_path):
     return model
 
 
-def _effective_linear_weight(m):
-    """W efectivo de un Linear, sumando el delta LoRA si existe (eval).
-
-    En forward el delta es (x @ A @ B) con A:(in,r), B:(r,out); para sumarlo
-    al weight (out,in) hay que transponerlo.
-    """
-    w = m.weight.detach()
-    if hasattr(m, "lora_A"):
-        w = w + (m.lora_A.detach() @ m.lora_B.detach()).T * float(m.lora_scale)
-    return w
-
-
 def _iter_dino_attn(backbone):
     """Yieldea los modulos de atencion de cada bloque, en orden."""
     for blk in backbone.blocks:
@@ -177,20 +165,30 @@ def _iter_dino_attn(backbone):
 
 
 def dino_forward_features(wrapper, frame_np, dev):
-    """Forward RGB + captura por hooks.
+    """Forward RGB + captura por hooks, recomputo EXACTO de attention.
+
+    Se hook-ea cada modulo de atencion guardando (input, rope). El qkv se
+    recomputa con el propio `mod.qkv(x)` (exacto: incluye LoRA y mascaras,
+    sin matematica manual de pesos). v2: softmax(QK^T*scale). v3: el propio
+    `mod.apply_rope(q, k, rope)` + softmax(QK^T/sqrt(d)), igual que el SDPA
+    fused interno. Todo en eval (sin dropout).
 
     Returns:
-        attns: lista por capa de (h, N, N) numpy (solo DINOv2; [] en v3).
+        attns: lista por capa de (h, N, N) numpy (v2 y v3).
         hidden_last: (1+N, D) numpy del ultimo layer (CLS primero).
-        psize: lado del grid de parches. n_patches: N-1 (v2) o N-1-storage (v3).
+        psize: lado del grid de parches (parches = N-1-storage).
+        n_storage: tokens de storage (v3) o 0 (v2).
     """
     backbone = wrapper.model
+    is_v3 = getattr(wrapper, "_is_dinov3", False)
     attn_mods = list(_iter_dino_attn(backbone))
     saved = {}
     hooks = []
     for i, mod in enumerate(attn_mods):
-        hooks.append(mod.register_forward_hook(
-            lambda m, inp, out, _i=i: saved.__setitem__(_i, inp[0].detach())))
+        def _hook(m, args, kwargs, output, _i=i):
+            rope = kwargs.get("rope", args[1] if len(args) > 1 else None)
+            saved[_i] = (args[0].detach(), rope)
+        hooks.append(mod.register_forward_hook(_hook, with_kwargs=True))
     try:
         x = ToTensor()(Image.fromarray(frame_np)).unsqueeze(0).to(dev)
         with torch.no_grad():
@@ -200,23 +198,27 @@ def dino_forward_features(wrapper, frame_np, dev):
             h.remove()
 
     hidden_last = out.last_hidden_state[0].cpu().numpy()  # (1+N, D)
-    is_v3 = getattr(wrapper, "_is_dinov3", False)
-    n_storage = 0
+    n_storage = int(getattr(backbone, "n_storage_tokens", 0) or 0) if is_v3 else 0
+
     attns = []
-    if not is_v3:
+    with torch.no_grad():
         for i, mod in enumerate(attn_mods):
-            x_in = saved[i].float()
-            w_eff = _effective_linear_weight(mod.qkv).float()
-            b = mod.qkv.bias.float() if mod.qkv.bias is not None else None
-            B, N, _ = x_in.shape
+            x_in, rope = saved[i]
+            x_in = x_in.float()
             h = mod.num_heads
-            d = w_eff.shape[0] // 3 // h
-            qkv = F.linear(x_in, w_eff, b).reshape(B, N, 3, h, d).permute(2, 0, 3, 1, 4)
-            q, k = qkv[0] * mod.scale, qkv[1]
-            attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)  # (B, h, N, N)
+            C = mod.qkv.in_features
+            d = C // h
+            qkv = mod.qkv(x_in).reshape(1, -1, 3, h, d).permute(2, 0, 3, 1, 4)
+            q, k, _ = qkv[0], qkv[1], qkv[2]
+            if is_v3:
+                if rope is None:
+                    raise ValueError(f"capa {i}: rope no capturado en el hook")
+                q, k = mod.apply_rope(q, k, rope)
+                scale = float(getattr(mod, "scale", d ** -0.5))
+            else:
+                scale = float(mod.scale)
+            attn = ((q * scale) @ k.transpose(-2, -1)).softmax(dim=-1)
             attns.append(attn[0].cpu().numpy())
-    else:
-        n_storage = int(getattr(backbone, "n_storage_tokens", 0) or 0)
 
     n_patches = hidden_last.shape[0] - 1 - n_storage
     psize = int(math.sqrt(n_patches))
@@ -237,26 +239,26 @@ def _upsample_grid(g, h):
     return np.clip(big, 0, 1)
 
 
-def dino_attn_map(attns, psize, h, layer=-1, head=-1, aggregation="capa"):
-    """Heatmap CLS->parches desde attention explicita (DINOv2)."""
+def dino_attn_map(attns, psize, h, layer=-1, head=-1, aggregation="capa", key_start=1):
+    """Heatmap CLS->parches desde attention explicita (DINOv2 y v3)."""
     if aggregation == "global":
-        raw = np.stack([a[:, 0, 1:].mean(axis=0) for a in attns]).mean(axis=0)
+        raw = np.stack([a[:, 0, key_start:].mean(axis=0) for a in attns]).mean(axis=0)
     elif aggregation == "head":
-        raw = np.stack([a[head, 0, 1:] for a in attns]).mean(axis=0)
+        raw = np.stack([a[head, 0, key_start:] for a in attns]).mean(axis=0)
     else:
         lid = layer if layer >= 0 else len(attns) - 1
-        a = attns[lid][:, 0, 1:]
+        a = attns[lid][:, 0, key_start:]
         raw = a[head] if head >= 0 else a.mean(axis=0)
     return raw.reshape(psize, psize)
 
 
-def dino_heads_maps(attns, psize, layer=-1, aggregate_layers=False):
-    """Lista de heatmaps por cabeza (DINOv2)."""
+def dino_heads_maps(attns, psize, layer=-1, aggregate_layers=False, key_start=1):
+    """Lista de heatmaps por cabeza (DINOv2 y v3)."""
     if aggregate_layers:
-        raw = np.stack([a[:, 0, 1:] for a in attns]).mean(axis=0)  # (h, Np)
+        raw = np.stack([a[:, 0, key_start:] for a in attns]).mean(axis=0)  # (h, Np)
     else:
         lid = layer if layer >= 0 else len(attns) - 1
-        raw = attns[lid][:, 0, 1:]  # (h, Np)
+        raw = attns[lid][:, 0, key_start:]  # (h, Np)
     return [g.reshape(psize, psize) for g in raw]
 
 
@@ -275,8 +277,9 @@ def generate_gif_dino(wrapper, frames, output_path, fps=6, layer=-1, head=-1,
     frame_images = []
     for i, frm in enumerate(frames):
         print(f"Frame {i + 1}/{len(frames)}")
-        attns, _, psize, _ = dino_forward_features(wrapper, frm, dev)
-        raw = dino_attn_map(attns, psize, h, layer=layer, head=head, aggregation=aggregation)
+        attns, _, psize, n_storage = dino_forward_features(wrapper, frm, dev)
+        raw = dino_attn_map(attns, psize, h, layer=layer, head=head,
+                            aggregation=aggregation, key_start=1 + n_storage)
         heatmap = _blend(frm, _upsample_grid(raw, h))
         frame_images.append(make_frame_image(frm, heatmap))
     print("Armado GIF...")
@@ -291,8 +294,10 @@ def generate_heads_gif_dino(wrapper, frames, output_path, fps=6, layer=-1,
     frame_images = []
     for i, frm in enumerate(frames):
         print(f"Frame {i + 1}/{len(frames)}")
-        attns, _, psize, _ = dino_forward_features(wrapper, frm, dev)
-        raw_maps = dino_heads_maps(attns, psize, layer=layer, aggregate_layers=aggregate_layers)
+        attns, _, psize, n_storage = dino_forward_features(wrapper, frm, dev)
+        raw_maps = dino_heads_maps(attns, psize, layer=layer,
+                                   aggregate_layers=aggregate_layers,
+                                   key_start=1 + n_storage)
         h = frm.shape[0]
         maps = [(plt.get_cmap("magma_r")(_upsample_grid(g, h))[:, :, :3] * 255).astype(np.uint8)
                 for g in raw_maps]
@@ -823,9 +828,6 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     if is_dino:
-        if is_dinov3 and args.mode != "cosine":
-            raise ValueError("DINOv3 solo soporta mode=cosine (RoPE impide recomputar "
-                             "attention exacta); usa --mode cosine.")
         if args.mode == "cosine":
             generate_cosine_gif_dino(encoder, frames, f"{args.output_dir}/cosine.gif", dev=dev)
         elif args.mode == "heads":

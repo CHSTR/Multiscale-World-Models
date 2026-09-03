@@ -11,7 +11,9 @@ _target_: jepa.JEPA
 encoder:
   _target_: src.encoders.dinov3_encoder.DinoV3Encoder
   pretrained: true
-  ckpt_path: /home/chr/dinov3_wm/models/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+  # null = portable: usa $DINOV3_CKPT si existe, si no descarga por hub oficial.
+  # Override: model.encoder.ckpt_path=/ruta/al/pth
+  ckpt_path: null
   img_size: ${img_size}
   in_chans: 3              # RGB. Use 15 for the starlet variants (*_starlet_lora).
   lora_r: 8

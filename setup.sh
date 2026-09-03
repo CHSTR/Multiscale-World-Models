@@ -178,6 +178,11 @@ if [[ "$DINO3_CKPT" =~ ^https?:// ]]; then
 elif [[ "$DINO3_CKPT" =~ ^file:// ]]; then
   export DINOV3_CKPT="${DINO3_CKPT#file://}"
 fi
+# resolver rutas relativas a absolutas (el smoke/train heredan el env)
+if [[ -n "${DINOV3_CKPT:-}" && "$DINOV3_CKPT" != /* && "$DINOV3_CKPT" =~ ^\.?/ ]]; then
+  DINOV3_CKPT="$(realpath -m "$ROOT/$DINOV3_CKPT" 2>/dev/null || echo "$ROOT/$DINOV3_CKPT")"
+  export DINOV3_CKPT
+fi
 if [[ -f "$DINOV3_CKPT" ]]; then
   echo "OK DINOV3_CKPT=$DINOV3_CKPT"
 else

@@ -2,8 +2,9 @@
 
 Replaces the previous ``vit_base`` / hardcoded-path wrapper with a *small*
 model (``vit_small`` / patch-16, embed dim 384) loaded through the official hub
-backbone ``src.dinov3.hub.backbones.dinov3_vits16``. By default the checkpoint
-at ``ckpt_path`` (a local copy of the LVD1689M vit_small/16 weights) is used.
+backbone ``src.dinov3.hub.backbones.dinov3_vits16``. Pesos: ``ckpt_path``
+explícito > ``$DINOV3_CKPT`` > descarga por hub oficial (``ckpt_path=null``
+= portable entre máquinas).
 
 Interface (compatible with ``jepa.JEPA.encode``):
 
@@ -20,8 +21,9 @@ the attention qkv/proj and everything except LoRA + norm + patch_embed (+
 storage/register tokens) is frozen.
 """
 
+import os
 import types
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -35,7 +37,8 @@ from src.encoders.vit_lora import (
 )
 
 
-DEFAULT_DINOV3_CKPT = "/home/chr/dinov3_wm/models/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+# Portable default: $DINOV3_CKPT si está definido, si no None (= descarga por hub).
+DEFAULT_DINOV3_CKPT = os.environ.get("DINOV3_CKPT") or None
 
 
 class DinoV3Encoder(nn.Module):
@@ -66,8 +69,17 @@ class DinoV3Encoder(nn.Module):
         # the ``img_size`` arg is accepted for API parity but the backbone
         # resolution is fixed. Variable input sizes are still handled at runtime
         # by JEPA's ``interpolate_pos_encoding=True``.
-        if ckpt_path is not None:
-            self.model = dinov3_vits16(weights=ckpt_path)
+        # Resolución: arg explícito > $DINOV3_CKPT > hub oficial.
+        # (ckpt_path=None en el yaml = portable entre máquinas.)
+        resolved_ckpt = ckpt_path or os.environ.get("DINOV3_CKPT") or None
+        if resolved_ckpt is not None:
+            if not os.path.isfile(resolved_ckpt):
+                raise FileNotFoundError(
+                    f"DINOv3 ckpt no encontrado: {resolved_ckpt}. "
+                    "Pasa model.encoder.ckpt_path=<ruta> o exporta DINOV3_CKPT=<ruta>, "
+                    "o deja ckpt_path=null para descargar por hub."
+                )
+            self.model = dinov3_vits16(weights=resolved_ckpt)
         else:
             self.model = dinov3_vits16(pretrained=pretrained)
 

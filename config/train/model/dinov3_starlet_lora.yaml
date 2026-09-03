@@ -15,14 +15,15 @@
 # frontend, use the 3-channel base yaml (dinov2_lora.yaml / dinov3_lora.yaml)
 # with `in_chans: 3` instead.
 #
-# The default checkpoint below is a local copy of the LVD1689M vit_small/16
-# weights; the backbone resolution is fixed at 224 (matching the checkpoint).
+# Pesos: ckpt_path=null usa $DINOV3_CKPT si existe, si no descarga por hub.
+# La resolución del backbone es fija a 224.
 _target_: jepa.JEPA
 
 encoder:
   _target_: src.encoders.dinov3_encoder.DinoV3Encoder
   pretrained: true
-  ckpt_path: /home/chr/dinov3_wm/models/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+  # null = portable: usa $DINOV3_CKPT si existe, si no descarga por hub oficial.
+  ckpt_path: null
   img_size: ${img_size}
   in_chans: 15             # 3 * (levels + 1) with levels = 4  (=> 3 * 5 = 15)
   lora_r: 8

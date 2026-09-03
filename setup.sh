@@ -112,11 +112,14 @@ source "$ROOT/.venv/bin/activate"
 # 3. Dependencias (resto de PyPI; el par torch/torchvision se fija después).
 #    stable-worldmodel[train,env] arrastra stable-pretraining, lightning, hydra.
 if [[ ! -f "$ROOT/.venv/.setup_done" ]] || (( FORCE )); then
-  uv pip install "stable-worldmodel[train,env]" einops wandb huggingface_hub
+  uv pip install "stable-worldmodel[train,env]" einops wandb huggingface_hub hdf5plugin h5py
   touch "$ROOT/.venv/.setup_done"
 else
   echo "deps ya instaladas (usa --force para reinstalar)"
 fi
+# Deps que stable_worldmodel importa pero no declara: se verifican siempre
+# (auto-repara venvs creados antes de añadirlas, sin --force).
+python -c "import hdf5plugin, h5py" 2>/dev/null || uv pip install hdf5plugin h5py
 # Parche crítico (se verifica SIEMPRE, auto-repara venvs rotos sin --force):
 # torch y torchvision deben ser matched pair del MISMO índice. Si torchvision
 # viene de PyPI y torch del índice CUDA (o viceversa), `import torchvision`

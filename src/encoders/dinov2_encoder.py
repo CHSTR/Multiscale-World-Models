@@ -17,6 +17,11 @@ conv is expanded to the new channel count (RGB weights copied, rest = mean) and
 made trainable, so the pretrained backbone can consume wavelet coefficient
 cannels. LoRA is applied to the attention qkv/proj and everything except LoRA +
 norm + patch_embed (+ storage/register tokens) is frozen.
+
+Starlet frontend (igual que el modelo original): con ``starlet_levels=L > 0``
+el wrapper aplica ``starlet_conv4d`` a los frames RGB en ``forward`` y deriva
+``in_chans = 3*(L+1)`` del int (ignora el ``in_chans`` manual). Con
+``starlet_levels=0`` entra RGB puro.
 """
 
 import types
@@ -25,6 +30,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from wavelet.starlet_torch import starlet_conv4d
 
 from src.encoders.vit_lora import (
     apply_lora_to_vit,
@@ -45,6 +52,9 @@ class DinoV2Encoder(nn.Module):
         img_size: int = 224,
         in_chans: int = 3,
         patch_embed_mode: str = "adapt",
+        starlet_levels: int = 0,
+        starlet_filter: str = "b3",
+        starlet_learnable_weights: bool = True,
         lora_r: int = 8,
         lora_alpha: float = 16,
         lora_dropout: float = 0.1,
@@ -53,9 +63,20 @@ class DinoV2Encoder(nn.Module):
     ):
         super().__init__()
         self.img_size = img_size
-        self.in_chans = in_chans
         self.embed_dim = 384
         self.patch_embed_mode = patch_embed_mode
+        # Frontend starlet (igual que wavelet.starlet_encoder.StarletEncoder):
+        # el int manda y deriva in_chans = 3*(L+1).
+        self.starlet_levels = int(starlet_levels)
+        self.starlet_filter = starlet_filter
+        if self.starlet_levels > 0:
+            in_chans = 3 * (self.starlet_levels + 1)
+            w = torch.ones(self.starlet_levels + 1)
+            if starlet_learnable_weights:
+                self.level_weights = nn.Parameter(w)
+            else:
+                self.register_buffer("level_weights", w)
+        self.in_chans = in_chans
 
         from src.dinov2.hub.backbones import dinov2_vits14
 
@@ -93,16 +114,19 @@ class DinoV2Encoder(nn.Module):
         self.to(device)
         print(
             f"DinoV2Encoder(vits14, dim={self.embed_dim}, in_chans={in_chans}, "
-            f"lora_layers={len(self._lora_layers)}) "
+            f"starlet_levels={self.starlet_levels}, lora_layers={len(self._lora_layers)}) "
             f"[trainable={count_trainable_parameters(self):,}/{count_total_parameters(self):,} params]"
         )
 
     def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = True,
                 prompt: Optional[torch.Tensor] = None, **kwargs):
         """Return an object exposing ``last_hidden_state`` ``(B, 1+N, 384)`` (CLS first)."""
+        x = pixel_values
+        if self.starlet_levels > 0:
+            x = starlet_conv4d(x, self.starlet_levels, scale=self.level_weights, filter=self.starlet_filter)
         # ``is_training=True`` makes the backbone return the feature dict, from
         # which we assemble the full (normed) token sequence with CLS first.
-        features = self.model(pixel_values, prompt=prompt, is_training=True)
+        features = self.model(x, prompt=prompt, is_training=True)
 
         cls = features["x_norm_clstoken"]  # (B, 384)
         patches = features["x_norm_patchtokens"]  # (B, N, 384)

@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # setup.sh — réplica rápida del entorno de entrenamiento en cualquier máquina.
 #
-# Basado en el repo original https://github.com/lucas-maes/le-wm :
-#   uv venv --python=3.10 ; uv pip install "stable-worldmodel[train,env]"
+# Basado en el repo original https://github.com/lucas-maes/le-wm , con el fix
+# de su upstream (galilai-group/stable-worldmodel desde fuente):
+#   uv venv --python=3.10
+#   git clone https://github.com/galilai-group/stable-worldmodel
+#   uv pip install -e ".[all]"   (= train,env,format,data: trae hdf5plugin,
+#                                  stack lance, gymnasium[all] y pines compatibles)
 #   datos HDF5 de https://huggingface.co/collections/quentinll/lewm
 #   tar --zstd -xvf archive.tar.zst -> $STABLEWM_HOME (~/.stable-wm/)
 #
 # Uso:
 #   ./setup.sh [--python 3.10] [--torch auto|cu128|cu126|cu124|cu121|cu118|cpu]
 #              [--data tworoom|pusht|all|none] [--dino3-ckpt PATH-O-URL]
-#              [--train none|smoke|baseline|dino|all] [--wandb offline|none]
-#              [--recreate] [--force]
+#              [--swm-src DIR] [--train none|smoke|baseline|dino|all]
+#              [--wandb offline|none] [--recreate] [--force]
 #
 # Todo es idempotente: re-ejecutar no reinstala ni re-descarga salvo --recreate/--force.
 # Log completo en setup.log ; pines finales en requirements.lock
@@ -31,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --torch) TORCH="$2"; shift 2;;
     --data) DATA="$2"; shift 2;;
     --dino3-ckpt) DINO3_CKPT="$2"; shift 2;;
+    --swm-src) SWM_SRC="$2"; shift 2;;
     --train) TRAIN="$2"; shift 2;;
     --wandb) WANDB_MODE_ARG="$2"; shift 2;;
     --recreate) RECREATE=1; shift;;
@@ -42,6 +47,7 @@ done
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 LOG="$ROOT/setup.log"
+SWM_SRC="${SWM_SRC:-$ROOT/../stable-worldmodel}"
 exec > >(tee -a "$LOG") 2>&1
 echo "=== setup.sh $(date -u +%FT%TZ) en $ROOT ==="
 
@@ -109,11 +115,23 @@ fi
 # shellcheck disable=SC1091
 source "$ROOT/.venv/bin/activate"
 
-# 3. Dependencias (resto de PyPI; el par torch/torchvision se fija después).
-#    stable-worldmodel[train,env] arrastra stable-pretraining, lightning, hydra.
-if [[ ! -f "$ROOT/.venv/.setup_done" ]] || (( FORCE )); then
-  uv pip install "stable-worldmodel[train,env]" einops wandb huggingface_hub hdf5plugin h5py pyarrow-hotfix
-  touch "$ROOT/.venv/.setup_done"
+# 3. stable-worldmodel desde fuente (editable, extras [all]).
+#    El sdist de PyPI deja fuera pines que el repo sí resuelve; instalar desde
+#    git con [all] (= train,env,format,data) trae además hdf5plugin/h5py,
+#    torchcodec, el stack lance (lancedb/pylance/pyarrow) y gymnasium[all].
+#    Equivale al fix manual: git clone stable-worldmodel + uv pip install -e ".[all]".
+if [[ ! -d "$SWM_SRC/.git" ]]; then
+  echo "clonando stable-worldmodel en $SWM_SRC ..."
+  git clone https://github.com/galilai-group/stable-worldmodel "$SWM_SRC"
+elif (( FORCE )); then
+  echo "actualizando stable-worldmodel en $SWM_SRC ..."
+  git -C "$SWM_SRC" pull --ff-only || echo "AVISO: no se pudo actualizar $SWM_SRC, se sigue con lo que hay"
+else
+  echo "stable-worldmodel ya clonado en $SWM_SRC (usa --force para actualizar)"
+fi
+if [[ ! -f "$ROOT/.venv/.setup_done_v2" ]] || (( FORCE )); then
+  uv pip install -e "$SWM_SRC[all]" einops wandb huggingface_hub pyarrow-hotfix
+  touch "$ROOT/.venv/.setup_done_v2"
 else
   echo "deps ya instaladas (usa --force para reinstalar)"
 fi
@@ -126,8 +144,14 @@ python -c "import pyarrow as pa; assert hasattr(pa, 'PyExtensionType')" 2>/dev/n
 # Parche crítico (se verifica SIEMPRE, auto-repara venvs rotos sin --force):
 # torch y torchvision deben ser matched pair del MISMO índice. Si torchvision
 # viene de PyPI y torch del índice CUDA (o viceversa), `import torchvision`
-# falla con "operator torchvision::nms does not exist".
-if ! python -c "import torch, torchvision; torchvision.ops.nms(torch.rand(2,4), torch.rand(2), 0.5)" >/dev/null 2>&1; then
+# falla con "operator torchvision::nms does not exist". Además, si hay GPU
+# pero torch no la ve (wheel CPU), se reinstala del índice CUDA detectado.
+NEED_TORCH_FIX=0
+python -c "import torch, torchvision; torchvision.ops.nms(torch.rand(2,4), torch.rand(2), 0.5)" >/dev/null 2>&1 || NEED_TORCH_FIX=1
+if (( ! NEED_TORCH_FIX )) && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  python -c "import torch; assert torch.cuda.is_available()" >/dev/null 2>&1 || NEED_TORCH_FIX=1
+fi
+if (( NEED_TORCH_FIX )); then
   echo "reparando pair torch/torchvision desde $TORCH_URL ..."
   uv pip install --index-url "$TORCH_URL" --force-reinstall --no-deps torch torchvision
 fi

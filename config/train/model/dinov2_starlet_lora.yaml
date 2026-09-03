@@ -1,0 +1,71 @@
+# DINOv2 vit_small/14 (embed dim 384) + LoRA, fed by a 15-channel starlet frontend.
+#
+# STARLET FRONTEND (simple path)
+# ------------------------------
+# `in_chans` is set to 15 = 3 * (levels + 1) for a level-4 Haar/orthonormal
+# starlet decomposition (bands L1,L2,L3,L4 + residual = levels+1 = 5 bands).
+# The encoder therefore expands its patch-embedding conv from 3 -> 15 channels
+# (RGB weights copied, extra channels filled with the mean) and only the new
+# conv weights are trainable.
+#
+# NOTE: this yaml does NOT wrap the encoder in `wavelet.starlet_encoder`. The
+# wavelet decomposition (starlet_conv4d) must be applied to the RGB frames
+# *before* they reach the encoder (i.e. in the data/preprocessing frontend), so
+# the encoder simply receives 15-channel tensors. If you do NOT want a starlet
+# frontend, use the 3-channel base yaml (dinov2_lora.yaml / dinov3_lora.yaml)
+# with `in_chans: 3` instead.
+#
+# To actually decompose frames with the wavelet frontend, point the data pipeline
+# at wavelet.starlet_encoder.StarletEncoder (a ViT wrapper that runs
+# starlet_conv4d internally); that path uses a HF `vit_hf` backbone, not these
+# DINO encoders.
+_target_: jepa.JEPA
+
+encoder:
+  _target_: src.encoders.dinov2_encoder.DinoV2Encoder
+  pretrained: true
+  ckpt_path: null          # null => download from the HF hub (official vits14)
+  img_size: ${img_size}
+  in_chans: 15             # 3 * (levels + 1) with levels = 4  (=> 3 * 5 = 15)
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_targets: ["qkv", "proj"]
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+# Projector 384 (encoder) -> ${embed_dim} (workspace).
+projector:
+  _target_: module.MLP
+  input_dim: 384
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# Predictor head ${embed_dim} -> ${embed_dim}.
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

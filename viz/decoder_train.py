@@ -230,8 +230,8 @@ def save_preview(real, recon, path, n=6):
     axes[1, 0].set_ylabel("recon")
     fig.suptitle(path.stem, fontsize=11)
     plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    return fig  # el caller decide si cerrarla (p.ej. tras loguearla en wandb)
 
 
 # --------------------------------------------------------------------------- #
@@ -256,10 +256,16 @@ def main():
     p.add_argument("--depth", type=int, default=3)
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--preview-every", type=int, default=2000)
+    p.add_argument("--preview-every", type=int, default=1000)
     p.add_argument("--out-dir", default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--amp", action="store_true", help="usa bf16 en el forward del decoder")
+    p.add_argument("--wandb", action="store_true",
+                   help="loguea en wandb el preview (real vs recon) cada --preview-every steps")
+    p.add_argument("--wandb-entity", default="chstr")
+    p.add_argument("--wandb-project", default="lewm")
+    p.add_argument("--wandb-name", default=None,
+                   help="nombre del run (por defecto: decoder_<ckpt_stem>_<source>)")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -280,6 +286,19 @@ def main():
     model = load_world_model(args.ckpt, device)
     latent_dim = infer_latent_dim(model, cfg.img_size, device, args.source)
     print(f"[decoder] encoder congelado | source={args.source} | latent_dim={latent_dim}")
+
+    # -- wandb (opcional)
+    if args.wandb:
+        import wandb
+        run_name = args.wandb_name or f"decoder_{Path(args.ckpt).stem}_{args.source}"
+        wandb.init(entity=args.wandb_entity, project=args.wandb_project, name=run_name)
+        wandb.config.update(
+            {"ckpt": args.ckpt, "source": args.source, "latent_dim": latent_dim,
+             "steps": args.steps, "batch_size": args.batch_size, "lr": args.lr,
+             "patch_size": args.patch_size, "dim": args.dim, "heads": args.heads,
+             "depth": args.depth}
+        )
+        print(f"[decoder] wandb run: {args.wandb_entity}/{args.wandb_project}/{run_name}")
 
     n_trainable = sum(p_.numel() for p_ in model.parameters() if p_.requires_grad)
     assert n_trainable == 0, f"el world model tiene {n_trainable} params entrenables, deberia ser 0"
@@ -353,7 +372,13 @@ def main():
         if (step + 1) % args.preview_every == 0 or (step + 1) == args.steps:
             decoder.eval()
             with torch.no_grad():
-                save_preview(pixels, decoder(z).float(), out_dir / f"recon_step_{step + 1}.png")
+                recon = decoder(z).float()
+                fig = save_preview(pixels, recon, out_dir / f"recon_step_{step + 1}.png")
+                if args.wandb:
+                    import wandb
+                    wandb.log({"recon/real_vs_recon": wandb.Image(fig),
+                               "recon/mse": loss.item()}, step=step + 1)
+                plt.close(fig)
             decoder.train()
             torch.save(
                 {
@@ -372,6 +397,9 @@ def main():
             )
 
     print(f"[decoder] listo. Salidas en {out_dir}")
+    if args.wandb:
+        import wandb
+        wandb.finish()
 
 
 if __name__ == "__main__":

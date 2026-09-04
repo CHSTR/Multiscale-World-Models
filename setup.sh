@@ -200,12 +200,18 @@ for d in "${want[@]:-}"; do
     mkdir -p "$dl"
     hf download "$repo" --repo-type dataset --local-dir "$dl" 2>/dev/null \
       || huggingface-cli download "$repo" --repo-type dataset --local-dir "$dl"
-    # archives estilo original: tar --zstd -xvf archive.tar.zst, y .h5.zst
-    # (pusht viene como pusht_expert_train.h5.zst; zstd es contenedor).
-    for a in "$dl"/*.tar.zst "$dl"/*.h5.zst; do
+    # archives estilo original: tar --zstd -xvf archive.tar.zst (contenedor).
+    # pusht viene como pusht_expert_train.h5.zst: un stream zstd PLANO (no tar),
+    # se descomprime con zstd -d y queda el .h5 al lado.
+    for a in "$dl"/*.tar.zst; do
       [[ -f "$a" ]] || continue
-      echo "extrayendo $a ..."
+      echo "extrayendo (tar) $a ..."
       tar --zstd -xvf "$a" -C "$dl"
+    done
+    for a in "$dl"/*.h5.zst; do
+      [[ -f "$a" ]] || continue
+      echo "descomprimiendo (zstd) $a ..."
+      zstd -d -f "$a"
     done
     place_dataset_files "$dl"
   else

@@ -12,7 +12,7 @@
 #
 # Uso:
 #   ./setup.sh [--python 3.10] [--torch auto|cu128|cu126|cu124|cu121|cu118|cpu]
-#              [--data tworoom|pusht|all|none] [--dino3-ckpt PATH-O-URL]
+#              [--data tworoom|pusht|cube|all|none] [--dino3-ckpt PATH-O-URL]
 #              [--swm-src DIR] [--train none|smoke|baseline|dino|all]
 #              [--wandb offline|none] [--recreate] [--force]
 #
@@ -188,7 +188,7 @@ declare -A REPOS=( [tworoom]="quentinll/lewm-tworooms" [pusht]="quentinll/lewm-p
                    [cube]="quentinll/lewm-cube" [reacher]="quentinll/lewm-reacher" )
 want=()
 case "$DATA" in
-  tworoom) want=(tworoom);; pusht) want=(pusht);;
+  tworoom) want=(tworoom);; pusht) want=(pusht);; cube) want=(cube);;
   all) want=(tworoom pusht cube reacher);; none) want=();;
   *) echo "DATA inválido: $DATA"; exit 1;;
 esac
@@ -214,6 +214,16 @@ for d in "${want[@]:-}"; do
       zstd -d -f "$a"
     done
     place_dataset_files "$dl"
+    # cube: name: ogbench/cube_single_expert.h5 -> resuelve a <DS_DIR>/ogbench/...
+    if [[ "$d" == "cube" ]]; then
+      mkdir -p "$DS_DIR/ogbench"
+      for pat in "$dl"/*.h5 "$dl"/*/*.h5; do
+        [[ -f "$pat" ]] || continue
+        [[ "$(basename "$pat")" == "cube_single_expert.h5" ]] || continue
+        cp -f "$pat" "$DS_DIR/ogbench/cube_single_expert.h5"
+        echo "dataset: $DS_DIR/ogbench/cube_single_expert.h5"
+      done
+    fi
   else
     echo "dataset $d ya presente en $DS_DIR (usa --force para re-descargar)"
   fi
@@ -225,6 +235,9 @@ if [[ " ${want[*]} " == *"tworoom"* ]]; then
 fi
 if [[ " ${want[*]} " == *"pusht"* ]]; then
   [[ -f "$DS_DIR/pusht_expert_train.h5" ]] && echo "OK datasets/pusht_expert_train.h5" || echo "AVISO: falta datasets/pusht_expert_train.h5 (name: pusht_expert_train.h5 no resolverá)"
+fi
+if [[ " ${want[*]} " == *"cube"* ]]; then
+  [[ -f "$DS_DIR/ogbench/cube_single_expert.h5" ]] && echo "OK datasets/ogbench/cube_single_expert.h5" || echo "AVISO: falta datasets/ogbench/cube_single_expert.h5 (name: ogbench/cube_single_expert.h5 no resolverá)"
 fi
 
 # 5. Pesos DINO (v2 por hub = auto ; v3 vía DINOV3_CKPT, sin tocar yamls).

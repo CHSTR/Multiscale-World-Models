@@ -200,8 +200,9 @@ for d in "${want[@]:-}"; do
     mkdir -p "$dl"
     hf download "$repo" --repo-type dataset --local-dir "$dl" 2>/dev/null \
       || huggingface-cli download "$repo" --repo-type dataset --local-dir "$dl"
-    # archives estilo original: tar --zstd -xvf archive.tar.zst
-    for a in "$dl"/*.tar.zst; do
+    # archives estilo original: tar --zstd -xvf archive.tar.zst, y .h5.zst
+    # (pusht viene como pusht_expert_train.h5.zst; zstd es contenedor).
+    for a in "$dl"/*.tar.zst "$dl"/*.h5.zst; do
       [[ -f "$a" ]] || continue
       echo "extrayendo $a ..."
       tar --zstd -xvf "$a" -C "$dl"
@@ -217,7 +218,7 @@ if [[ " ${want[*]} " == *"tworoom"* ]]; then
   [[ -f "$DS_DIR/tworoom.h5" ]] && echo "OK datasets/tworoom.h5" || echo "AVISO: falta datasets/tworoom.h5 (name: tworoom.h5 no resolverá)"
 fi
 if [[ " ${want[*]} " == *"pusht"* ]]; then
-  [[ -e "$DS_DIR/pusht_expert_train.lance" ]] && echo "OK datasets/pusht_expert_train.lance" || echo "AVISO: falta datasets/pusht_expert_train.lance (name: pusht_expert_train.lance no resolverá)"
+  [[ -f "$DS_DIR/pusht_expert_train.h5" ]] && echo "OK datasets/pusht_expert_train.h5" || echo "AVISO: falta datasets/pusht_expert_train.h5 (name: pusht_expert_train.h5 no resolverá)"
 fi
 
 # 5. Pesos DINO (v2 por hub = auto ; v3 vía DINOV3_CKPT, sin tocar yamls).

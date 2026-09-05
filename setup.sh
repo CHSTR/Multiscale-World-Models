@@ -12,7 +12,7 @@
 #
 # Uso:
 #   ./setup.sh [--python 3.10] [--torch auto|cu128|cu126|cu124|cu121|cu118|cpu]
-#              [--data tworoom|pusht|cube|all|none] [--dino3-ckpt PATH-O-URL]
+#              [--data tworoom|pusht|cube|reacher|all|none] [--dino3-ckpt PATH-O-URL]
 #              [--swm-src DIR] [--train none|smoke|baseline|dino|all]
 #              [--wandb offline|none] [--recreate] [--force]
 #
@@ -188,7 +188,7 @@ declare -A REPOS=( [tworoom]="quentinll/lewm-tworooms" [pusht]="quentinll/lewm-p
                    [cube]="quentinll/lewm-cube" [reacher]="quentinll/lewm-reacher" )
 want=()
 case "$DATA" in
-  tworoom) want=(tworoom);; pusht) want=(pusht);; cube) want=(cube);;
+  tworoom) want=(tworoom);; pusht) want=(pusht);; cube) want=(cube);; reacher) want=(reacher);;
   all) want=(tworoom pusht cube reacher);; none) want=();;
   *) echo "DATA inválido: $DATA"; exit 1;;
 esac
@@ -238,6 +238,9 @@ if [[ " ${want[*]} " == *"pusht"* ]]; then
 fi
 if [[ " ${want[*]} " == *"cube"* ]]; then
   [[ -f "$DS_DIR/ogbench/cube_single_expert.h5" ]] && echo "OK datasets/ogbench/cube_single_expert.h5" || echo "AVISO: falta datasets/ogbench/cube_single_expert.h5 (name: ogbench/cube_single_expert.h5 no resolverá)"
+fi
+if [[ " ${want[*]} " == *"reacher"* ]]; then
+  [[ -f "$DS_DIR/reacher.h5" ]] && echo "OK datasets/reacher.h5" || echo "AVISO: falta datasets/reacher.h5 (name: reacher.h5 no resolverá)"
 fi
 
 # 5. Pesos DINO (v2 por hub = auto ; v3 vía DINOV3_CKPT, sin tocar yamls).

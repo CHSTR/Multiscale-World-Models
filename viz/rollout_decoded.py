@@ -120,23 +120,29 @@ def main():
     # dataset
     ds = load_dataset(cfg, args.data, cache_dir)
     n_rows = len(ds)
-    ep_col = "episode_idx" if "episode_idx" in ds.column_names else "ep_idx"
-    ep_arr = np.asarray(ds.get_col_data(ep_col))
-    ep = int(ep_arr[args.start])
-    ep_rows = np.nonzero(ep_arr == ep)[0]
-    ep_end = int(ep_rows[-1]) + 1
+    # límites de episodio vía ep_offset/ep_len (presentes en los h5 de lewm;
+    # evita leer la columna por-fila que puede fallar por filtros/compresión)
+    ep_off = np.asarray(ds.get_col_data("ep_offset"))
+    ep_len = np.asarray(ds.get_col_data("ep_len"))
+    e = int(np.searchsorted(ep_off, args.start, side="right") - 1)
+    ep_start = int(ep_off[e])
+    ep_end = int(ep_off[e]) + int(ep_len[e])
     need = args.start + args.ctx + args.n
     if need > ep_end:
         raise ValueError(
-            f"start={args.start}+ctx={args.ctx}+n={args.n}={need} sale del episodio {ep} "
+            f"start={args.start}+ctx={args.ctx}+n={args.n}={need} sale del episodio {e} "
             f"(termina en {ep_end - 1}). Baja --start o --n."
         )
-    print(f"[rollout] dataset rows={n_rows} | episodio {ep} [{ep_rows[0]}..{ep_end - 1}]")
+    print(f"[rollout] dataset rows={n_rows} | episodio {e} [{ep_start}..{ep_end - 1}]")
 
     # contexto GT + acciones (bloqueadas: action por-step repetida frameskip veces)
     ds_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     frameskip = int(ds_cfg["frameskip"])
     ctx_pix = torch.stack([to_chw(ds.get_row_data(args.start + i)["pixels"]) for i in range(args.ctx)])
+    # GT futuro (los frames reales con los que se compara el rollout decodificado)
+    fut_pix = torch.stack(
+        [to_chw(ds.get_row_data(args.start + args.ctx + j)["pixels"]) for j in range(args.n)]
+    )
     raw_acts = torch.stack(
         [torch.as_tensor(ds.get_row_data(args.start + i)["action"]).float() for i in range(args.ctx + args.n)]
     )
@@ -175,17 +181,46 @@ def main():
         recons = denormalize(decoder(z).float()).cpu()
     recons = recons.clamp(0, 1)
 
-    # figura: ctx GT + n rollout
+    # figura: fila GT (contexto + futuro real) y fila rollout (contexto + decodificado)
+    # Sin padding entre paneles (wspace/hspace=0, aspect auto) y tiempo solo en la
+    # última fila: T=0,5,10,... (contexto) y 15,20,... (open-loop).
     n_panels = args.ctx + args.n
-    fig, axes = plt.subplots(1, n_panels, figsize=(2.0 * n_panels, 2.3))
+    fig, axes = plt.subplots(
+        2, n_panels, figsize=(2.0 * n_panels, 4.6),
+        gridspec_kw={"wspace": 0.0, "hspace": 0.0},
+    )
+
+    def _no_frame(ax):
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for s in ax.spines.values():
+            s.set_visible(False)
+
+    # fila superior = GT
     for i in range(args.ctx):
-        axes[i].imshow(to_hwc(ctx_pix[i]))
-        axes[i].set_title(f"ctx {i - args.ctx}", fontsize=9)
-        axes[i].axis("off")
+        axes[0, i].imshow(to_hwc(ctx_pix[i]), aspect="auto")
+        _no_frame(axes[0, i])
     for j in range(args.n):
-        axes[args.ctx + j].imshow(to_hwc(recons[j]))
-        axes[args.ctx + j].set_title(f"roll +{j + 1}", fontsize=9)
-        axes[args.ctx + j].axis("off")
+        axes[0, args.ctx + j].imshow(to_hwc(fut_pix[j]), aspect="auto")
+        _no_frame(axes[0, args.ctx + j])
+    # fila inferior = rollout decodificado
+    for i in range(args.ctx):
+        axes[1, i].imshow(to_hwc(ctx_pix[i]), aspect="auto")
+        _no_frame(axes[1, i])
+    for j in range(args.n):
+        axes[1, args.ctx + j].imshow(to_hwc(recons[j]), aspect="auto")
+        _no_frame(axes[1, args.ctx + j])
+
+    # título del bloque de contexto (centrado sobre las primeras 3 columnas, fila GT)
+    axes[0, (args.ctx - 1) // 2].set_title("Context Input", fontsize=10, pad=6)
+    # labels de fila
+    axes[0, 0].set_ylabel("GT", fontsize=10)
+    axes[1, 0].set_ylabel("rollout", fontsize=10)
+    # tiempo solo en la última fila: T=0,5,10,... (frameskip en pasos de 5)
+    for i in range(n_panels):
+        t = 5 * i
+        axes[1, i].set_xlabel(f"T={t}", fontsize=8)
+        axes[1, i].xaxis.set_label_coords(0.5, -0.04)
     fig.suptitle(
         f"{Path(args.ckpt).parent.name} | {args.data or cfg.data.dataset.get('name', '')} | "
         f"decoder source={dec_source} | start={args.start}",

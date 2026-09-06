@@ -87,17 +87,25 @@ DIRS = {
 # --------------------------------------------------------------------------- #
 
 
-def make_action_block(vec2, magnitude):
+def _full_action(vec):
+    """Convierte un vector (posiblemente 2D del pad) a uno de longitud a_dim."""
+    a = [0.0] * CTX.a_dim
+    for i, v in enumerate(vec[: CTX.a_dim]):
+        a[i] = float(v)
+    return a
+
+
+def make_action_block(action_vec, magnitude):
     """Construye el bloque de accion normalizado que espera el action_encoder.
 
-    La accion cruda es de a_dim (2 en TwoRoom) y el dataset la entrega agrupada
-    en n_sub sub-pasos (frameskip), es decir n_sub*a_dim = 10. Las estadisticas
-    z-score son de la accion SIN agrupar, asi que se normaliza por sub-accion.
+    action_vec es de longitud CTX.a_dim en unidades crudas (0 = reposo); la
+    accion cruda se repite en n_sub sub-pasos (frameskip) y se normaliza por
+    sub-accion con las estadisticas z-score (igual que en el entrenamiento).
     """
-    a_dim, n_sub = CTX.a_dim, CTX.n_sub
-    raw = torch.tensor(list(vec2[:a_dim]), dtype=torch.float32) * magnitude
-    raw = raw.repeat(n_sub).reshape(1, n_sub, a_dim)
-    return CTX.act_scaler(raw).reshape(1, n_sub * a_dim)
+    n_sub = CTX.n_sub
+    raw = torch.tensor(list(action_vec), dtype=torch.float32) * magnitude
+    raw = raw.repeat(n_sub).reshape(1, n_sub, CTX.a_dim)
+    return CTX.act_scaler(raw).reshape(1, n_sub * CTX.a_dim)
 
 
 def to_display(emb_vec):
@@ -181,9 +189,9 @@ def random_anchor():
             return i
 
 
-def _advance(emb, acts, direction, magnitude):
+def _advance(emb, acts, action_vec, magnitude):
     """Un paso latente. Devuelve (emb, acts) actualizados."""
-    a = make_action_block(DIRS[direction], magnitude).to(CTX.device)
+    a = make_action_block(action_vec, magnitude).to(CTX.device)
     acts = torch.cat([acts, a.unsqueeze(0)], dim=1)   # len(acts) == len(emb)
     HS = CTX.history_size
     with torch.no_grad():
@@ -192,16 +200,26 @@ def _advance(emb, acts, direction, magnitude):
     return torch.cat([emb, pred], dim=1), acts
 
 
-def step(state, direction, magnitude, history):
-    """Aplica UNA accion y avanza un paso latente imaginado."""
+def step(state, action_vec, magnitude, history):
+    """Aplica UNA accion (vector de longitud a_dim) y avanza un paso imaginado."""
     if state is None:
         return state, None, "Pulsa **Anclar** primero.", history, _plot(history)
 
-    emb, acts = _advance(state["emb"], state["acts"], direction, magnitude)
+    emb, acts = _advance(state["emb"], state["acts"], action_vec, magnitude)
     state = {"emb": emb, "acts": acts}
     m = metrics(emb)
     history = (history or []) + [m["energy"]]
     return state, to_display(emb[0, -1]), status_md(m), history, _plot(history)
+
+
+def step_pad(state, direction, magnitude, history):
+    """Pad 2D (solo a_dim == 2): la direccion del boton rellena las 2 primeras dims."""
+    return step(state, _full_action(DIRS[direction]), magnitude, history)
+
+
+def step_sliders(state, magnitude, history, *action_vals):
+    """Sliders por dimension de accion (a_dim arbitrario)."""
+    return step(state, list(action_vals), magnitude, history)
 
 
 def undo(state, history):
@@ -266,7 +284,7 @@ def run_cycle(state, pattern, n, magnitude):
     dists, frames = [], []
     keep = max(1, len(seq) // 6)
     for i, d in enumerate(seq):
-        emb, acts = _advance(emb, acts, d, magnitude)
+        emb, acts = _advance(emb, acts, _full_action(DIRS[d]), magnitude)
         dists.append((emb[0, -1] - z0).pow(2).mean().item())
         if i % keep == 0 or i == len(seq) - 1:
             frames.append((to_display(emb[0, -1]), f"{i + 1}: {d}"))
@@ -330,13 +348,29 @@ def build_ui():
 
             with gr.Column(scale=2):
                 imag_img = gr.Image(label="estado imaginado", height=360)
-                magnitude = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="magnitud de la accion")
-                pad = []
-                for row in (["↖", "↑", "↗"], ["←", "•", "→"], ["↙", "↓", "↘"]):
-                    with gr.Row():
-                        for d in row:
-                            pad.append(gr.Button(d, scale=1))
+                magnitude = gr.Slider(
+                    0.0, 1.0, value=CTX.act_std, step=0.05,
+                    label=f"magnitud (default 1 std = {CTX.act_std:.2f})",
+                )
                 btn_undo = gr.Button("↩ deshacer paso")
+
+                if CTX.a_dim == 2:
+                    gr.Markdown("**Pad 2D** — accion = direccion × magnitud")
+                    pad = []
+                    for row in (["↖", "↑", "↗"], ["←", "•", "→"], ["↙", "↓", "↘"]):
+                        with gr.Row():
+                            for d in row:
+                                pad.append(gr.Button(d, scale=1))
+                else:
+                    gr.Markdown(
+                        f"**Accion {CTX.a_dim}D** — un slider por dimension "
+                        f"(unidades crudas, escala con magnitud arriba)"
+                    )
+                    action_sliders = [
+                        gr.Slider(-1.0, 1.0, value=0.0, step=0.05, label=f"a{i}")
+                        for i in range(CTX.a_dim)
+                    ]
+                    btn_apply = gr.Button("▶ aplicar accion", variant="primary")
 
             with gr.Column(scale=1):
                 status = gr.Markdown()
@@ -345,24 +379,27 @@ def build_ui():
         outs = [state, imag_img, status, history, plot]
         btn_rand.click(lambda: random_anchor(), outputs=start)
         btn_anchor.click(anchor, [start], [state, real_img, imag_img, status, history, plot])
-        for b in pad:
-            b.click(step, [state, gr.State(b.value), magnitude, history], outs)
+        if CTX.a_dim == 2:
+            for b in pad:
+                b.click(step_pad, [state, gr.State(b.value), magnitude, history], outs)
+        else:
+            btn_apply.click(step_sliders, [state, magnitude, history] + action_sliders, outs)
         btn_undo.click(undo, [state, history], outs)
 
-        gr.Markdown("---\n## Test de ciclo\n"
-                    "Ejecuta una secuencia cerrada desde el estado actual y mide si vuelves "
-                    "al mismo latente. **No modifica** el estado interactivo. Corre siempre el "
-                    "patron *control* tambien: no deberia cerrar.")
-        with gr.Row():
-            cyc_pattern = gr.Dropdown(list(CYCLES), value="ida y vuelta (horizontal)", label="patron")
-            cyc_n = gr.Slider(2, 120, value=20, step=1, label="N (pasos por tramo)")
-            btn_cycle = gr.Button("▶ ejecutar ciclo", variant="primary")
-        with gr.Row():
-            cyc_gallery = gr.Gallery(label="trayectoria imaginada", columns=7, height=180)
-            cyc_result = gr.Markdown()
-
-        btn_cycle.click(run_cycle, [state, cyc_pattern, cyc_n, magnitude],
-                        [cyc_gallery, cyc_result])
+        if CTX.a_dim == 2:
+            gr.Markdown("---\n## Test de ciclo\n"
+                        "Ejecuta una secuencia cerrada desde el estado actual y mide si vuelves "
+                        "al mismo latente. **No modifica** el estado interactivo. Corre siempre el "
+                        "patron *control* tambien: no deberia cerrar.")
+            with gr.Row():
+                cyc_pattern = gr.Dropdown(list(CYCLES), value="ida y vuelta (horizontal)", label="patron")
+                cyc_n = gr.Slider(2, 120, value=20, step=1, label="N (pasos por tramo)")
+                btn_cycle = gr.Button("▶ ejecutar ciclo", variant="primary")
+            with gr.Row():
+                cyc_gallery = gr.Gallery(label="trayectoria imaginada", columns=7, height=180)
+                cyc_result = gr.Markdown()
+            btn_cycle.click(run_cycle, [state, cyc_pattern, cyc_n, magnitude],
+                            [cyc_gallery, cyc_result])
 
     return demo
 
@@ -398,6 +435,7 @@ def main():
     col = torch.from_numpy(np.array(CTX.dataset.get_col_data("action")))
     col = col[~torch.isnan(col).any(dim=1)]
     CTX.a_dim = col.size(-1)
+    CTX.act_std = float(col.std(0).mean())
     CTX.act_scaler = ZScoreNormalizer(
         col.mean(0, keepdim=True).clone(), col.std(0, keepdim=True).clone()
     )

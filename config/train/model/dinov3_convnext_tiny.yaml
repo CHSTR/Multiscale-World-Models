@@ -1,0 +1,62 @@
+# DINOv3 ConvNeXt-tiny (embed dim 768) + manual LoRA on the block pwconv1/pwconv2,
+# for JEPA.
+#
+# The DINOv3 backbone outputs 768-d tokens; the projector maps them down to the
+# workspace dim `${embed_dim}` (192) used by the predictor/action encoder.
+# Only LoRA factors (+ norm + stem) are trainable.
+#
+# Run with:  model=dinov3_convnext_tiny   (checkpoint null = portable, download
+# by hub; override with model.encoder.ckpt_path=<ruta> o $DINOV3_CONVNEXT_CKPT).
+_target_: jepa.JEPA
+
+encoder:
+  _target_: src.encoders.dinov3_convnext_encoder.DinoV3ConvNeXtEncoder
+  pretrained: true
+  size: tiny                 # tiny | small | base  (embed dim 768 / 768 / 1024)
+  # null = portable: usa $DINOV3_CONVNEXT_CKPT si existe, si no descarga por hub oficial.
+  # Override: model.encoder.ckpt_path=/ruta/al/pth
+  ckpt_path: null
+  img_size: ${img_size}
+  in_chans: 3              # RGB. Use 15 for the starlet variants (*_starlet_lora).
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_targets: ["pwconv1", "pwconv2"]
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+# Projector 768 (ConvNeXt-tiny) -> ${embed_dim} (workspace).
+projector:
+  _target_: module.MLP
+  input_dim: 768
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# Predictor head ${embed_dim} -> ${embed_dim}.
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

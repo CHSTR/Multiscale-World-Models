@@ -35,7 +35,11 @@ class JEPA(nn.Module):
         b = pixels.size(0)
         pixels = rearrange(pixels, "b t ... -> (b t) ...") # flatten for encoding
         output = self.encoder(pixels, interpolate_pos_encoding=True)
-        pixels_emb = output.last_hidden_state[:, 0] #output.last_hidden_state  # all tokens, not just cls token
+        # Prefer the encoder's ``pooled`` summary (dynamic-token aware); fall
+        # back to the CLS token for encoders that only expose last_hidden_state.
+        pixels_emb = getattr(output, "pooled", None)
+        if pixels_emb is None:
+            pixels_emb = output.last_hidden_state[:, 0]
         emb = self.projector(pixels_emb)
         info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b) #rearrange(emb, "(b t) n d -> b t n d", b=b)
 

@@ -205,26 +205,14 @@ class DinoVisionTransformer(nn.Module):
             )
 
         if prompt is not None:
-            # version 1
-            # Concatenate the CLS token, prompt, and storage tokens
-
-            # x = torch.cat(
-            #     [
-            #         cls_token.expand(B, -1, -1),
-            #         prompt.expand(B, -1, -1),
-            #         storage_tokens.expand(B, -1, -1),
-            #         x,
-            #     ],
-            #     dim=1,
-            # )
-
-            # version 2
-            # Concatenate the CLS token, and storage tokens + prompt learning
-
-            storage_tokens += prompt
+            # version 1: prepend prompt tokens (e.g. learned dynamic tokens)
+            # between the CLS token and the storage tokens. ``expand`` shares the
+            # prompt across the batch dimension and does NOT write in-place, so
+            # the shared ``nn.Parameter`` prompt is never mutated.
             x = torch.cat(
                 [
                     cls_token.expand(B, -1, -1),
+                    prompt.expand(B, -1, -1),
                     storage_tokens.expand(B, -1, -1),
                     x,
                 ],
@@ -246,7 +234,9 @@ class DinoVisionTransformer(nn.Module):
         x = []
         rope = []
         if prompt_list is not None:
-            prompt = len(prompt_list[0])
+            # ``prompt_list`` is a per-crop list; ``prompt_list[0]`` has shape
+            # (B, n_prompt, D) so ``.shape[1]`` is the number of prompt tokens.
+            prompt = prompt_list[0].shape[1]
         else:
             prompt = 0
             prompt_list = [None] * len(x_list)
@@ -268,20 +258,30 @@ class DinoVisionTransformer(nn.Module):
                 if self.untie_global_and_local_cls_norm and self.training and idx == 1:
                     # Assume second entry of list corresponds to local crops.
                     # We only ever apply this during training.
-                    x_norm_cls_reg = self.local_cls_norm(x[:, : self.n_storage_tokens + prompt])
+                    x_norm_cls_reg = self.local_cls_norm(
+                        x[:, : self.n_storage_tokens + 1 + prompt]
+                    )
                 elif self.untie_cls_and_patch_norms:
-                    x_norm_cls_reg = self.cls_norm(x[:, : self.n_storage_tokens + prompt])
+                    x_norm_cls_reg = self.cls_norm(
+                        x[:, : self.n_storage_tokens + 1 + prompt]
+                    )
                 else:
-                    x_norm_cls_reg = self.norm(x[:, : self.n_storage_tokens + prompt])
-                x_norm_patch = self.norm(x[:, self.n_storage_tokens + prompt :])
+                    x_norm_cls_reg = self.norm(
+                        x[:, : self.n_storage_tokens + 1 + prompt]
+                    )
+                x_norm_patch = self.norm(x[:, self.n_storage_tokens + 1 + prompt :])
             else:
                 x_norm = self.norm(x)
-                x_norm_cls_reg = x_norm[:, : self.n_storage_tokens + prompt]
-                x_norm_patch = x_norm[:, self.n_storage_tokens + prompt :]
+                # ``+ 1`` accounts for the CLS token at position 0, so the region
+                # covers [CLS, prompt(=dynamic) tokens, storage tokens].
+                x_norm_cls_reg = x_norm[:, : self.n_storage_tokens + 1 + prompt]
+                x_norm_patch = x_norm[:, self.n_storage_tokens + 1 + prompt :]
+            n_prompt = prompt
             output.append(
                 {
                     "x_norm_clstoken": x_norm_cls_reg[:, 0],
-                    "x_storage_tokens": x_norm_cls_reg[:, 1:],
+                    "x_prompt_tokens": x_norm_cls_reg[:, 1 : 1 + n_prompt],
+                    "x_storage_tokens": x_norm_cls_reg[:, 1 + n_prompt :],
                     "x_norm_patchtokens": x_norm_patch,
                     "x_prenorm": x,
                     "masks": masks,
@@ -296,8 +296,10 @@ class DinoVisionTransformer(nn.Module):
         else:
             return self.forward_features_list(x, masks, prompt_list=prompt)
 
-    def _get_intermediate_layers_not_chunked(self, x: Tensor, n: int = 1) -> List[Tensor]:
-        x, (H, W) = self.prepare_tokens_with_masks(x)
+    def _get_intermediate_layers_not_chunked(
+        self, x: Tensor, n: int = 1, prompt=None
+    ) -> List[Tensor]:
+        x, (H, W) = self.prepare_tokens_with_masks(x, prompt=prompt)
         # If n is an int, take the n last blocks. If it's a list, take them
         output, total_block_len = [], len(self.blocks)
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n

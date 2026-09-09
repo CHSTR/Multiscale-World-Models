@@ -19,6 +19,11 @@ modules named ``qkv``/``proj`` (attention) and -- optionally -- ``fc1``/``fc2``
 (MLP), which are the attributes used by both
 ``src.dinov2.models.vision_transformer`` and
 ``src.dinov3.models.vision_transformer`` attention blocks.
+
+For the ConvNeXt backbone (``src.dinov3.models.convnext.ConvNeXt``) the attention
+blocks are replaced by ``Block`` modules exposing two ``Linear`` layers named
+``pwconv1`` / ``pwconv2`` (the pointwise MLP). Passing ``add_convnext=True``
+converts those as well.
 """
 
 from typing import Iterable, List, Optional
@@ -97,6 +102,7 @@ def apply_lora_to_vit(
     dropout: float = 0.0,
     targets: Iterable[str] = ("qkv", "proj"),
     add_mlp: bool = False,
+    add_convnext: bool = False,
 ) -> List[str]:
     """In-place LoRA patch of a ViT.
 
@@ -106,8 +112,15 @@ def apply_lora_to_vit(
     ``src.dinov2`` and ``src.dinov3`` ViTs because both store attention as a
     module exposing ``qkv`` and ``proj`` and MLP as ``fc1``/``fc2``.
 
+    For the ConvNeXt backbone the attention blocks are replaced by ``Block``
+    modules exposing ``pwconv1`` / ``pwconv2`` (pointwise MLP ``Linear``s);
+    ``add_convnext=True`` converts those too.
+
     Returns the dotted names of the layers that were converted.
     """
+    if r <= 0:
+        # No low-rank factors to add; leave the backbone untouched.
+        return []
     targets = list(targets)
     replaced: List[str] = []
     for name, module in model.named_modules():
@@ -124,6 +137,13 @@ def apply_lora_to_vit(
 
         if add_mlp:
             for sub in ("fc1", "fc2"):
+                sub_module = getattr(module, sub, None)
+                if _is_linear(sub_module):
+                    setattr(module, sub, convert_linear_to_lora(sub_module, r, alpha, dropout))
+                    replaced.append(name + "." + sub)
+
+        if add_convnext:
+            for sub in ("pwconv1", "pwconv2"):
                 sub_module = getattr(module, sub, None)
                 if _is_linear(sub_module):
                     setattr(module, sub, convert_linear_to_lora(sub_module, r, alpha, dropout))
@@ -175,6 +195,15 @@ def freeze_except_lora_norm_patch(model: nn.Module) -> None:
         value = getattr(model, attr, None)
         if isinstance(value, nn.Parameter):
             value.requires_grad_(True)
+
+
+def freeze_all(model: nn.Module) -> None:
+    """Freeze every parameter of ``model`` (100%), including normalization
+    layers, LoRA factors, the patch-embedding and the storage / register /
+    dynamic tokens. Nothing stays trainable.
+    """
+    for param in model.parameters():
+        param.requires_grad_(False)
 
 
 def _find_patch_embed(model: nn.Module):

@@ -1,0 +1,81 @@
+# DINOv3 vit_small/16 (embed dim 384) + FULLY FROZEN backbone (DINO-WM-style "suelo").
+#
+# This is the 0-parameters-of-the-sweep baseline point: the whole ViT backbone
+# is frozen (100% of its params, incl. norms, patch-embed and storage tokens),
+# so the *encoder* contributes ZERO trainable parameters. Only the projector,
+# the predictor and the action encoder learn.
+#
+# Implementation (identical to dinov3_lora.yaml except the encoder block below):
+#   * n_dyn_tokens = 0   -> [CLS, storage, patches] only (no dynamic tokens).
+#   * lora_r = 0         -> apply_lora_to_vit() early-returns [] (no LoRA added).
+#   * freeze_mode = "all"-> freeze_all() freezes the 100% of the backbone.
+#
+# Run with:  model=dinov3_frozen
+#   (the default checkpoint below is a local copy of the LVD1689M vit_small/16
+#    weights). Overrides used in the sweep command below are shown after this
+#    block.
+_target_: jepa.JEPA
+
+encoder:
+  _target_: src.encoders.dinov3_encoder.DinoV3Encoder
+  pretrained: true
+  # null = portable: usa $DINOV3_CKPT si existe, si no descarga por hub oficial.
+  # Override: model.encoder.ckpt_path:/ruta/al/pth
+  ckpt_path: null
+  img_size: ${img_size}
+  in_chans: 3              # RGB. Use 15 for the starlet variants (*_starlet_lora).
+  # --- Frozen backbone (0 trainable params in the encoder) ---
+  lora_r: 0
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_targets: ["qkv", "proj"]
+  n_dyn_tokens: 0
+  freeze_mode: "all"
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+# Projector 384 (encoder) -> ${embed_dim} (workspace).
+projector:
+  _target_: module.MLP
+  input_dim: 384
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# Predictor head ${embed_dim} -> ${embed_dim}.
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# --- Training command (sweep "suelo" point, dataset tworoom, 10 epochs, 3 seeds) ---
+# Export the local checkpoint once, then launch the 3-seed sweep:
+#     export DINOV3_CKPT=/home/chr/dinov3_wm/models/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+# for seed in 3072 1234 5678; do \
+#   python train.py model=dinov3_frozen data=tworoom \
+#     trainer.max_epochs=10 seed=$seed & \
+# done
+# Wait: the optimizer is a single model_opt over all trainable params (projector +
+# predictor + action_encoder); only those learn, the backbone stays frozen.

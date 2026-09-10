@@ -230,18 +230,30 @@ class DinoVisionTransformer(nn.Module):
 
         return x, (H, W)
 
-    def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor], prompt_list: List[Tensor]) -> List[Dict[str, Tensor]]:
+    def forward_features_list(
+        self,
+        x_list: List[Tensor],
+        masks_list: List[Tensor],
+        prompt=None,
+    ) -> List[Dict[str, Tensor]]:
         x = []
         rope = []
-        if prompt_list is not None:
-            # ``prompt_list`` is a per-crop list; ``prompt_list[0]`` has shape
-            # (B, n_prompt, D) so ``.shape[1]`` is the number of prompt tokens.
-            prompt = prompt_list[0].shape[1]
+        # ``prompt`` may be a single shared tensor ``(1, N, D)`` (the
+        # direct-predictor contract: the encoder passes its ``prompt_tokens``
+        # parameter directly) or a per-crop list/tuple of tensors. In both
+        # cases ``.shape[1]`` is the number of prompt tokens (``n_prompt``).
+        if prompt is not None:
+            if isinstance(prompt, (list, tuple)):
+                n_prompt = prompt[0].shape[1]
+                prompt_for_each = list(prompt)
+            else:
+                n_prompt = prompt.shape[1]
+                prompt_for_each = [prompt] * len(x_list)
         else:
-            prompt = 0
-            prompt_list = [None] * len(x_list)
+            n_prompt = 0
+            prompt_for_each = [None] * len(x_list)
 
-        for t_x, t_masks, t_prompt in zip(x_list, masks_list, prompt_list):
+        for t_x, t_masks, t_prompt in zip(x_list, masks_list, prompt_for_each):
             t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks, prompt=t_prompt)
             x.append(t2_x)
             rope.append(hw_tuple)
@@ -259,24 +271,23 @@ class DinoVisionTransformer(nn.Module):
                     # Assume second entry of list corresponds to local crops.
                     # We only ever apply this during training.
                     x_norm_cls_reg = self.local_cls_norm(
-                        x[:, : self.n_storage_tokens + 1 + prompt]
+                        x[:, : self.n_storage_tokens + 1 + n_prompt]
                     )
                 elif self.untie_cls_and_patch_norms:
                     x_norm_cls_reg = self.cls_norm(
-                        x[:, : self.n_storage_tokens + 1 + prompt]
+                        x[:, : self.n_storage_tokens + 1 + n_prompt]
                     )
                 else:
                     x_norm_cls_reg = self.norm(
-                        x[:, : self.n_storage_tokens + 1 + prompt]
+                        x[:, : self.n_storage_tokens + 1 + n_prompt]
                     )
-                x_norm_patch = self.norm(x[:, self.n_storage_tokens + 1 + prompt :])
+                x_norm_patch = self.norm(x[:, self.n_storage_tokens + 1 + n_prompt :])
             else:
                 x_norm = self.norm(x)
                 # ``+ 1`` accounts for the CLS token at position 0, so the region
                 # covers [CLS, prompt(=dynamic) tokens, storage tokens].
-                x_norm_cls_reg = x_norm[:, : self.n_storage_tokens + 1 + prompt]
-                x_norm_patch = x_norm[:, self.n_storage_tokens + 1 + prompt :]
-            n_prompt = prompt
+                x_norm_cls_reg = x_norm[:, : self.n_storage_tokens + 1 + n_prompt]
+                x_norm_patch = x_norm[:, self.n_storage_tokens + 1 + n_prompt :]
             output.append(
                 {
                     "x_norm_clstoken": x_norm_cls_reg[:, 0],
@@ -292,9 +303,9 @@ class DinoVisionTransformer(nn.Module):
     def forward_features(self, x: Tensor | List[Tensor], masks: Optional[Tensor] = None, prompt=None) -> List[Dict[str, Tensor]]:
         # print("prompt:", prompt)
         if isinstance(x, torch.Tensor):
-            return self.forward_features_list([x], [masks], prompt_list=prompt)[0]
+            return self.forward_features_list([x], [masks], prompt=prompt)[0]
         else:
-            return self.forward_features_list(x, masks, prompt_list=prompt)
+            return self.forward_features_list(x, masks, prompt=prompt)
 
     def _get_intermediate_layers_not_chunked(
         self, x: Tensor, n: int = 1, prompt=None

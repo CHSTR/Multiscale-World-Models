@@ -9,63 +9,72 @@ explícito > ``$DINOV3_CKPT`` > descarga por hub oficial (``ckpt_path=null``
 Interface (compatible with ``jepa.JEPA.encode``):
 
     out = encoder(pixel_values, interpolate_pos_encoding=True)
-    emb = out.last_hidden_state[:, 0]      # CLS token -> (B, 384)
+    emb = out.pooled                       # == tok_in  (BT, 384)
 
-``last_hidden_state`` is ``(B, 1 + n_storage + N, 384)`` with the CLS token
-first (storage tokens follow, then patch tokens).
+``jepa.encode`` reads ``out.pooled`` and falls back to
+``out.last_hidden_state[:, 0]`` when the encoder does not expose ``pooled``.
 
-Multicanal support: with ``in_chans=3`` the original patch embedding is kept.
-With ``in_chans > 3`` the ``patch_embed`` conv is expanded to the new channel
-count (RGB weights copied, rest = mean) and made trainable. LoRA is applied to
-the attention qkv/proj and everything except LoRA + norm + patch_embed (+
-storage/register tokens) is frozen.
+Direct-predictor contract (unified dynamic prompt tokens)
+---------------------------------------------------------
+The encoder owns a *single* learnable ``prompt_tokens`` parameter of shape
+``(1, n_in_tokens + n_tgt_tokens, 384)``. The backbone prepends its own CLS
+token and concatenates ``prompt_tokens`` right after it (concatenation via
+``expand`` -- never in-place -- so the shared ``nn.Parameter`` is never mutated),
+so the sequence seen by the transformer is::
 
-Starlet frontend (igual que el modelo original): con ``starlet_levels=L > 0``
-el wrapper aplica ``starlet_conv4d`` a los frames RGB en ``forward`` y deriva
-``in_chans = 3*(L+1)`` del int (ignora el ``in_chans`` manual). Con
-``starlet_levels=0`` entra RGB puro.
+    [CLS, prompt_in_1..n_in, prompt_tgt_1..n_tgt, storage_1..4, patches]
 
-Tokens dinámicos (``n_dyn_tokens=k > 0``): se añaden ``k`` tokens aprendibles que
-se intercalan entre el CLS y los storage tokens. El orden de secuencia pasa a
-ser ``[CLS, dyn_1..k, storage_1..4, patches]``. Con ``k=0`` el comportamiento es
-idéntico al actual (``[CLS, storage, patches]``).
+In ``forward`` the raw prompt tokens are read from the backbone feature dict::
 
-La salida es un ``types.SimpleNamespace`` con:
+    features = self.model(x, prompt=self.prompt_tokens, is_training=True)
+    tok      = features["x_prompt_tokens"]        # (BT, n_in+n_tgt, 384)
+    tok_in   = tok[:, 0]                           # (BT, 384)  -- the "input" token
+    tok_tgt  = tok[:, 1:]                          # (BT, n_tgt, 384)
+    if tie_tgt_to_in: tok_tgt = tok_in.unsqueeze(1)
 
-* ``last_hidden_state``: ``(B, 1 + k + n_storage + N, 384)`` con el orden de
-  secuencia de arriba.
-* ``pooled``: resumen usado por ``jepa.encode`` (ver ``readout``).
-* ``cls``: el token CLS (``(B, 384)``).
-* ``dyn_tokens``: el ``nn.Parameter`` de tokens dinámicos (o ``None`` si ``k=0``).
+The returned ``types.SimpleNamespace`` exposes:
 
-``readout`` define cómo se construye ``pooled``:
-``cls`` (default) => CLS (con k=0 equivale a ``last_hidden_state[:, 0]``),
-``dyn_first`` => primer token dinámico, ``dyn_mean`` => media de los dinámicos,
-``dyn_concat`` => concatenación aplanada de los dinámicos (``readout_dim = k*384``).
+* ``last_hidden_state``: full sequence ``[CLS, prompt_tokens, storage, patches]``.
+* ``cls``: the backbone CLS token ``(BT, 384)``.
+* ``tok_in``: first prompt token ``(BT, 384)``.
+* ``tok_tgt``: remaining prompt tokens ``(BT, n_tgt, 384)`` (or ``tok_in``
+  repeated when ``tie_tgt_to_in=True``).
+* ``pooled``: == ``tok_in`` (this is what ``jepa.encode`` reads -- the original
+  JEPA path keeps working unchanged).
 
-``dyn_init`` define la inicialización de los tokens dinámicos (sólo con
-``k > 0``). ``init_std`` (``None`` por defecto) controla la escala del ruido:
-``None`` conserva EXACTAMENTE la escala legacy ``0.02 * base.abs().mean()`` y un
-``float`` se usa directamente como ``std`` del ruido (en ``cls_noise`` /
-``normal`` / ``random``). ``cls`` y ``zeros`` no usan ruido:
+``readout_dim`` is always 384 (the pooled summary is a single 384-d token).
 
-============== ==========================================================
-``dyn_init``   inicialización de ``self.dyn_tokens`` ``(1, k, 384)``
-============== ==========================================================
-``cls``        copia EXACTA del ``cls_token``; ruido forzado a 0 aunque
-               ``init_std > 0`` (punto idéntico al baseline).
-``cls_noise``  copia del ``cls_token`` + ``N(0, init_std)`` por token.
-``zeros``      ceros exactos; con readout sobre los dyn (``dyn_first`` /
-               ``dyn_mean`` / ``dyn_concat``) arranca degenerado a propósito:
-               el punto de control "sin prior".
-``storage``    copia de ``storage_tokens`` + ``N(0, 0.02*sigma)`` (legacy).
-``normal``     ``N(0, 0.02)`` (o ``N(0, init_std)`` si se pasa ``init_std``).
-============== ==========================================================
+Defaults are ``n_in_tokens=1`` and ``n_tgt_tokens=1`` (a 2-token prompt); the
+total prompt length is ``n_in_tokens + n_tgt_tokens``.
+
+``tok_init`` initializes *every* prompt token:
+
+============ =========================================================
+``tok_init`` inicialización de ``self.prompt_tokens`` ``(1, n_prompt, 384)``
+============ =========================================================
+``cls``      copia EXACTA del ``cls_token`` del backbone; ruido forzado a 0.
+``cls_noise`` copia del ``cls_token`` + ``N(0, init_std)`` por token.
+``normal``   ``N(0, 0.02)`` (o ``N(0, init_std)`` si se pasa ``init_std``).
+============ =========================================================
+
+``freeze_mode`` congela el backbone: ``lora_norm_patch`` (default) congela todo
+salvo LoRA + norms + patch-embed (+ storage tokens); ``all`` congela el 100%.
+
+Compatibilidad con la API vieja
+-------------------------------
+El argumento legacy ``n_dyn_tokens=k`` (número de tokens dinámicos que seguían al
+CLS) sigue aceptado y se mapea a la nueva configuración de prompt como
+``n_in_tokens=1`` + ``n_tgt_tokens=k-1`` (``k<=0`` => ``n_tgt_tokens=0``, i.e. un
+sólo token de prompt). Esto mantiene los configs existentes (p. ej.
+``dinov3_frozen.yaml`` con ``n_dyn_tokens=0``) funcionando sin tocar el yaml.
+
+Los nombres viejos ``readout`` / ``dyn_init`` / ``dyn_tokens`` **ya no** existen:
+usa ``tok_init`` / ``prompt_tokens``.
 """
 
 import os
 import types
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import nn
@@ -85,14 +94,18 @@ from src.encoders.vit_lora import (
 # Portable default: $DINOV3_CKPT si está definido, si no None (= descarga por hub).
 DEFAULT_DINOV3_CKPT = os.environ.get("DINOV3_CKPT") or None
 
-# Validaciones de los args de tokens dinámicos.
-READOUT_OPTIONS = ("cls", "dyn_first", "dyn_mean", "dyn_concat")
-DYN_INIT_OPTIONS = ("cls", "cls_noise", "zeros", "storage", "normal")
+# Inicialización de los prompt tokens.
+TOK_INIT_OPTIONS = ("cls", "cls_noise", "normal")
 FREEZE_MODE_OPTIONS = ("lora_norm_patch", "all")
 
 
 class DinoV3Encoder(nn.Module):
-    """ViT-small / patch-16 (dim 384) DINOv3 encoder with optional LoRA + multicanal patch embed."""
+    """ViT-small / patch-16 (dim 384) DINOv3 encoder with LoRA + multicanal patch embed.
+
+    Contrato direct-predictor: un sólo ``nn.Parameter prompt_tokens`` de forma
+    ``(1, n_in_tokens + n_tgt_tokens, 384)``; la salida expone ``tok_in`` /
+    ``tok_tgt`` / ``pooled == tok_in``.
+    """
 
     def __init__(
         self,
@@ -107,10 +120,14 @@ class DinoV3Encoder(nn.Module):
         lora_r: int = 8,
         lora_alpha: float = 16,
         lora_dropout: float = 0.1,
-        lora_targets: Tuple[str, ...] = ("qkv", "proj"),
-        n_dyn_tokens: int = 0,
-        readout: str = "cls",
-        dyn_init: str = "cls",
+        lora_targets = ("qkv", "proj"),
+        # --- Contrato direct-predictor (API unificada de prompt) ---
+        n_in_tokens: int = 1,
+        n_tgt_tokens: int = 1,
+        tok_init: str = "cls",
+        tie_tgt_to_in: bool = False,
+        # --- Compat con la vieja API de tokens dinámicos ---
+        n_dyn_tokens: Optional[int] = None,
         init_std: Optional[float] = None,
         freeze_mode: str = "lora_norm_patch",
         device: str = "cpu",
@@ -120,20 +137,31 @@ class DinoV3Encoder(nn.Module):
         self.embed_dim = 384
         self.patch_embed_mode = patch_embed_mode
 
-        # --- Tokens dinámicos / freeze ---
-        assert readout in READOUT_OPTIONS, f"readout {readout!r} no válido (opciones: {READOUT_OPTIONS})"
-        assert dyn_init in DYN_INIT_OPTIONS, f"dyn_init {dyn_init!r} no válido (opciones: {DYN_INIT_OPTIONS})"
+        assert tok_init in TOK_INIT_OPTIONS, (
+            f"tok_init {tok_init!r} no válido (opciones: {TOK_INIT_OPTIONS})"
+        )
         assert freeze_mode in FREEZE_MODE_OPTIONS, (
             f"freeze_mode {freeze_mode!r} no válido (opciones: {FREEZE_MODE_OPTIONS})"
         )
-        self.n_dyn_tokens = int(n_dyn_tokens)
-        self.readout = readout
-        self.dyn_init = dyn_init
+        assert int(n_in_tokens) >= 1, "n_in_tokens debe ser >= 1 (tok_in = tok[:,0])"
+        assert int(n_tgt_tokens) >= 0, "n_tgt_tokens debe ser >= 0"
+
+        # --- Compat legacy: n_dyn_tokens=k => prompt tokens tras el CLS ---
+        # Nueva API: 1 token de input + (k - 1) tokens de target.
+        if n_dyn_tokens is not None:
+            n_in_tokens = 1
+            n_tgt_tokens = max(int(n_dyn_tokens) - 1, 0)
+
+        self.n_in_tokens = int(n_in_tokens)
+        self.n_tgt_tokens = int(n_tgt_tokens)
+        self.n_prompt_tokens = self.n_in_tokens + self.n_tgt_tokens
+        self.tok_init = tok_init
         self.init_std = init_std
+        self.tie_tgt_to_in = bool(tie_tgt_to_in)
         self.freeze_mode = freeze_mode
-        # dim de la salida ``pooled``: CLS/readouts por defecto = 384;
-        # dyn_concat aplana los k tokens dinámicos => k*384.
-        self.readout_dim = self.n_dyn_tokens * self.embed_dim if readout == "dyn_concat" else self.embed_dim
+        # El pooled es un sólo token 384-d => readout_dim fijo.
+        self.readout_dim = self.embed_dim
+
         # Frontend starlet (igual que wavelet.starlet_encoder.StarletEncoder):
         # el int manda y deriva in_chans = 3*(L+1).
         self.starlet_levels = int(starlet_levels)
@@ -182,151 +210,121 @@ class DinoV3Encoder(nn.Module):
         else:
             freeze_except_lora_norm_patch(self.model)
 
-        # Tokens dinámicos: se crean *después* del freeze para que queden
+        # Prompt tokens: se crean *después* del freeze para que queden
         # entrenables por defecto en ``lora_norm_patch``. En ``all`` se congelan
-        # explícitamente a continuación.
-        if self.n_dyn_tokens > 0:
-            self._create_dyn_tokens(device)
-            if freeze_mode == "all":
-                self.dyn_tokens.requires_grad_(False)
+        # explícitamente a continuación. ``_init_prompt_tokens`` crea el
+        # ``nn.Parameter`` y lo inicializa.
+        self._init_prompt_tokens()
+        if freeze_mode == "all":
+            self.prompt_tokens.requires_grad_(False)
 
         self.to(device)
         n_storage = getattr(self.model, "n_storage_tokens", 0)
         print(
             f"DinoV3Encoder(vits16, dim={self.embed_dim}, in_chans={in_chans}, "
             f"starlet_levels={self.starlet_levels}, "
-            f"n_storage={n_storage}, n_dyn={self.n_dyn_tokens}, readout={self.readout}, "
+            f"n_storage={n_storage}, n_prompt={self.n_prompt_tokens} "
+            f"(n_in={self.n_in_tokens}, n_tgt={self.n_tgt_tokens}), tok_init={self.tok_init}, "
+            f"tie_tgt_to_in={self.tie_tgt_to_in}, readout_dim={self.readout_dim}, "
             f"freeze_mode={self.freeze_mode}, lora_layers={len(self._lora_layers)}) "
             f"[trainable={count_trainable_parameters(self):,}/{count_total_parameters(self):,} params]"
         )
 
-    def _create_dyn_tokens(self, device: str) -> None:
-        """Crear y inicializar ``self.dyn_tokens`` (``(1, k, 384)``).
+    def _init_prompt_tokens(self) -> None:
+        """Inicializar ``self.prompt_tokens`` (``(1, n_prompt, 384)``).
 
-        Modos de inicialización (``dyn_init``) con ``k > 0``:
+        Modos (``tok_init``):
 
-        * ``cls``       -> copia EXACTA del ``cls_token``; ruido forzado a 0
-          aunque ``init_std > 0`` (punto idéntico al baseline).
-        * ``cls_noise`` -> copia del ``cls_token`` + ruido
-          ``N(0, init_std)`` independiente por token (helper ``_dyn_noise``).
-        * ``zeros``     -> ``nn.Parameter`` a ceros exactos; con readout sobre
-          los dyn arranca degenerado a propósito ("sin prior").
-        * ``storage``   -> copia del ``storage_tokens`` + ruido
-          ``N(0, 0.02 * sigma)`` (si existe); si no, ``N(0, 0.02)``.
+        * ``cls``       -> copia EXACTA del ``cls_token`` del backbone; ruido 0.
+        * ``cls_noise`` -> copia + ``N(0, init_std)`` por token (helper
+          ``_prompt_noise``).
         * ``normal``    -> ``N(0, 0.02)`` (o ``N(0, init_std)``).
 
         ``init_std`` controla la escala del ruido: ``None`` conserva EXACTAMENTE
         la escala legacy ``0.02 * base.abs().mean()``; un ``float`` se usa como
-        ``std`` directo. ``cls`` y ``zeros`` no usan ruido.
+        ``std`` directo.
         """
-        k = self.n_dyn_tokens
-        self.dyn_tokens = nn.Parameter(torch.zeros(1, k, self.embed_dim, device=device))
-
+        k = self.n_prompt_tokens
+        device = self.model.cls_token.device
+        self.prompt_tokens = nn.Parameter(torch.zeros(1, k, self.embed_dim, device=device))
         with torch.no_grad():
-            if self.dyn_init == "cls":
-                # Exact copy of the CLS register; noise forced to 0 (baseline
-                # identical) even when ``init_std > 0``.
-                self.dyn_tokens.copy_(self.model.cls_token.detach().expand(1, k, self.embed_dim))
-            elif self.dyn_init == "cls_noise":
+            if self.tok_init == "cls":
+                # Exact copy of the CLS register; noise forced to 0 even when
+                # ``init_std > 0`` (baseline identical).
+                self.prompt_tokens.copy_(
+                    self.model.cls_token.detach().expand(1, k, self.embed_dim)
+                )
+            elif self.tok_init == "cls_noise":
                 base = self.model.cls_token.detach()  # (1, 1, 384)
-                self.dyn_tokens.copy_(base.expand(1, k, self.embed_dim))
-                self.dyn_tokens.add_(self._dyn_noise(k, base))
-            elif self.dyn_init == "zeros":
-                # Zero Parameter. With a readout that reads the dynamic tokens
-                # (``dyn_first`` / ``dyn_mean`` / ``dyn_concat``) the model starts
-                # degenerate on purpose: the "no prior" checkpoint. Nothing to do.
-                pass
-            elif self.dyn_init == "storage":
-                storage = getattr(self.model, "storage_tokens", None)
-                if storage is not None:
-                    sigma = storage.detach().abs().mean().item()
-                    self.dyn_tokens.copy_(storage.expand(1, k, self.embed_dim))
-                    noise = torch.randn(1, k, self.embed_dim, device=self.dyn_tokens.device) * (
-                        0.02 * sigma
-                    )
-                    self.dyn_tokens.add_(noise)
-                else:
-                    nn.init.normal_(self.dyn_tokens, std=0.02)
+                self.prompt_tokens.copy_(base.expand(1, k, self.embed_dim))
+                self.prompt_tokens.add_(self._prompt_noise(k, base))
             else:  # "normal"
-                self.dyn_tokens.data.normal_(
+                self.prompt_tokens.data.normal_(
                     0, self.init_std if self.init_std is not None else 0.02
                 )
 
-    def _dyn_noise(self, k: int, base: torch.Tensor) -> torch.Tensor:
-        """Gaussian noise ``N(0, std)`` per dynamic token (used by ``cls_noise``).
+    def _prompt_noise(self, k: int, base: torch.Tensor) -> torch.Tensor:
+        """Gaussian noise ``N(0, std)`` per prompt token (used by ``cls_noise``).
 
         ``std`` = ``init_std`` when passed, else the legacy
         ``0.02 * base.abs().mean()`` (so ``init_std=None`` is unchanged).
         """
         std = self.init_std if self.init_std is not None else 0.02 * base.abs().mean().item()
-        return torch.randn(1, k, self.embed_dim, device=self.dyn_tokens.device) * std
+        return torch.randn(1, k, self.embed_dim, device=self.prompt_tokens.device) * std
 
-    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = True,
-                prompt: Optional[torch.Tensor] = None, **kwargs):
-        """Return a ``SimpleNamespace`` with ``last_hidden_state``, ``pooled``,
-        ``cls`` and ``dyn_tokens``.
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        interpolate_pos_encoding: bool = True,
+        prompt: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """Return a ``SimpleNamespace`` with ``last_hidden_state``, ``cls``,
+        ``tok_in``, ``tok_tgt`` and ``pooled`` (== ``tok_in``).
 
-        The ``prompt`` kwarg is kept for API parity; the dynamic tokens are always
-        fed internally via ``self.dyn_tokens``, so callers do not pass it. The
-        backbone expects a per-crop *list* of prompt tensors, so we wrap the
-        single prompt tensor in a length-1 list -- ``prompt_list[0].shape[1]``
-        then equals the number of dynamic tokens ``k``.
-
-        Sequence order is ``[CLS, dyn_1..k, storage_1..4, patches]``; with
-        ``n_dyn_tokens=0`` this collapses to ``[CLS, storage, patches]`` (the
-        previous behavior).
+        The ``prompt`` kwarg is kept for API parity; the prompt tokens are always
+        fed internally via ``self.prompt_tokens`` so callers do not pass it.
         """
         x = pixel_values
         if self.starlet_levels > 0:
             x = starlet_conv4d(x, self.starlet_levels, scale=self.level_weights, filter=self.starlet_filter)
 
-        dyn = getattr(self, "dyn_tokens", None)
         # ``is_training=True`` makes the backbone return the feature dict from
-        # which we assemble the full (normed) token sequence.
-        features = self.model(x, prompt=[dyn] if dyn is not None else None, is_training=True)
+        # which we assemble the token sequence. The single prompt tensor is
+        # shared across the (single) input; ``n_prompt`` is derived from its
+        # ``shape[1]`` inside the backbone.
+        features = self.model(x, prompt=self.prompt_tokens, is_training=True)
 
-        cls = features["x_norm_clstoken"]            # (B, 384)
-        storage = features["x_storage_tokens"]       # (B, n_storage, 384)
-        patches = features["x_norm_patchtokens"]     # (B, N, 384)
-        dyn_toks = features["x_prompt_tokens"] if dyn is not None else None  # (B, k, 384)
+        cls = features["x_norm_clstoken"]            # (BT, 384)
+        storage = features["x_storage_tokens"]       # (BT, n_storage, 384)
+        patches = features["x_norm_patchtokens"]     # (BT, N, 384)
+        tok = features["x_prompt_tokens"]            # (BT, n_prompt, 384)
 
-        # Sequence order: [CLS, dyn_1..k, storage_1..4, patches]. With k=0 this
-        # collapses to [CLS, storage, patches] (identical to the old behavior).
+        # ``tok_in`` = primer prompt token (el "input"); ``tok_tgt`` = el resto.
+        tok_in = tok[:, 0]                           # (BT, 384)
+        if self.tie_tgt_to_in:
+            tok_tgt = tok_in.unsqueeze(1)            # (BT, 1, 384) == tok_in broadcast
+        else:
+            tok_tgt = tok[:, 1:]                     # (BT, n_tgt, 384)
+
+        # Secuencia completa: [CLS, prompt_tokens, storage, patches].
         parts = [cls.unsqueeze(1)]
-        if dyn_toks is not None and dyn_toks.shape[1] > 0:
-            parts.append(dyn_toks)
+        if tok.shape[1] > 0:
+            parts.append(tok)
         if storage is not None and storage.shape[1] > 0:
             parts.append(storage)
         parts.append(patches)
         last_hidden_state = torch.cat(parts, dim=1)
 
-        # ``pooled``: summary used by ``jepa.encode``, chosen by ``self.readout``.
-        if self.readout == "cls":
-            # CLS (with k=0 this equals ``last_hidden_state[:, 0]``).
-            pooled = cls
-        elif self.readout == "dyn_first":
-            assert dyn_toks is not None and dyn_toks.shape[1] > 0, (
-                "readout='dyn_first' needs n_dyn_tokens > 0"
-            )
-            pooled = dyn_toks[:, 0]
-        elif self.readout == "dyn_mean":
-            assert dyn_toks is not None and dyn_toks.shape[1] > 0, (
-                "readout='dyn_mean' needs n_dyn_tokens > 0"
-            )
-            pooled = dyn_toks.mean(dim=1)
-        elif self.readout == "dyn_concat":
-            assert dyn_toks is not None and dyn_toks.shape[1] > 0, (
-                "readout='dyn_concat' needs n_dyn_tokens > 0"
-            )
-            pooled = dyn_toks.reshape(cls.size(0), -1)
-        else:  # pragma: no cover - guarded by __init__ assert
-            raise ValueError(f"unknown readout {self.readout!r}")
+        # ``pooled``: resumen que lee ``jepa.encode`` (== tok_in).
+        pooled = tok_in
 
         return types.SimpleNamespace(
             last_hidden_state=last_hidden_state,
-            pooled=pooled,
-            dyn_tokens=dyn,
             cls=cls,
+            tok_in=tok_in,
+            tok_tgt=tok_tgt,
+            pooled=pooled,
         )
 
 

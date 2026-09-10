@@ -8,6 +8,7 @@ import stable_pretraining as spt
 import stable_worldmodel as swm
 import stable_worldmodel.data.formats.hdf5  # registra el formato HDF5
 import torch
+import torch.nn.functional as F
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
@@ -39,7 +40,60 @@ def lejepa_forward(self, batch, stage, cfg):
     # LeWM loss
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+
+    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'level_weights'):
+        for i, w in enumerate(self.model.encoder.level_weights):
+            losses_dict[f"{stage}/level_weight_{i}"] = w.detach()
+    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    return output
+
+
+def asym_forward(self, batch, stage, cfg):
+    """Asymmetric (n-step) forward.
+
+    Uses the AsymJEPA masked predictor. With ``num_preds == 1`` this reduces to
+    the plain AR / lewm forward, and with ``tie_tgt_to_in`` it is numerically
+    identical to ``lejepa_forward`` on a shared-weight original JEPA.
+    """
+
+    ctx = cfg.history_size
+    H = cfg.num_preds
+    lambd = cfg.loss.sigreg.weight
+
+    # Replace NaN values with 0 (occurs at sequence boundaries)
+    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+
+    out = self.model.encode(batch)
+    emb_in = out["emb_in"]      # (B, T, D)
+    emb_tgt = out["emb_tgt"]    # (B, T, K, D)
+    act_emb = out["act_emb"]    # (B, T, A_emb)
+
+    K = emb_tgt.size(2)
+
+    # Context + predicted horizon.
+    x_ctx = emb_in[:, :ctx]                       # (B, ctx, D)
+    c = act_emb[:, : ctx + H - 1]                 # (B, ctx+H-1, A_emb)
+    pred = self.model.predict(x_ctx, c, n_future=H - 1)   # (B, ctx+H-1, D)
+
+    # Per-frame target index (spec): clamp(arange(ctx+H-1)-(ctx-1)+1, min=1)-1, then <= K-1.
+    device = emb_tgt.device
+    k_idx = (torch.arange(ctx + H - 1, device=device) - (ctx - 1) + 1).clamp(min=1) - 1
+    k_idx = k_idx.clamp(max=K - 1)
+
+    # Select the k-th look-ahead target for each of the ctx+H-1 predicted frames.
+    frames = emb_tgt[:, 1 : ctx + H]              # (B, ctx+H-1, K, D)
+    idx = k_idx.reshape(1, -1, 1, 1).expand(frames.size(0), -1, -1, frames.size(-1))
+    tgt = frames.gather(2, idx).squeeze(2)        # (B, ctx+H-1, D)
+
+    output = dict(out)
+    output["pred_loss"] = F.mse_loss(pred, tgt)
+    # sigreg over emb_tgt as (T*K, B, D).
+    output["sigreg_loss"] = self.sigreg(
+        emb_tgt.permute(1, 2, 0, 3).reshape(-1, emb_tgt.size(0), emb_tgt.size(-1))
+    )
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'level_weights'):
@@ -114,10 +168,14 @@ def run(cfg):
     }
 
     data_module = spt.data.DataModule(train=train, val=val)
+    # Select the training forward: "asym" (next-n-step) or the default "lejepa".
+    _forward_name = cfg.model.get("forward", "lejepa")
+    _forward = asym_forward if _forward_name == "asym" else lejepa_forward
+
     world_model = spt.Module(
         model = world_model,
         sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
-        forward=partial(lejepa_forward, cfg=cfg),
+        forward=partial(_forward, cfg=cfg),
         optim=optimizers,
     )
 

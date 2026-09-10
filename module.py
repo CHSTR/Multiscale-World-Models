@@ -284,6 +284,39 @@ class ARPredictor(nn.Module):
         x = self.transformer(x, c)
         return x
 
+
+class MaskedPredictor(ARPredictor):
+    """AR predictor that rolls ``n_future`` steps ahead with a learnable mask.
+
+    A single ``mask_token`` ``(1, 1, input_dim)`` is initialised to zero and
+    re-initialised with a small Gaussian (std 0.02). ``forward`` appends
+    ``n_future`` expanded mask tokens after the context and delegates to the
+    parent (AR) forward, returning ``(B, ctx+n_future, D)``.
+
+    With ``n_future=0`` this reduces exactly to :class:`ARPredictor`.
+    """
+
+    def __init__(self, *args, **kwargs):
+        input_dim = kwargs.get("input_dim")
+        if input_dim is None:
+            raise TypeError("MaskedPredictor requires `input_dim`.")
+        super().__init__(*args, **kwargs)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, input_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
+
+    def forward(self, x_ctx, c, n_future=0):
+        """
+        x_ctx: (B, ctx, d)
+        c:     (B, ctx+n_future, act_dim)
+        """
+        B = x_ctx.size(0)
+        if n_future > 0:
+            mask = self.mask_token.expand(B, n_future, -1)
+            x = torch.cat([x_ctx, mask], dim=1)
+        else:
+            x = x_ctx
+        return super().forward(x, c)
+
 # Version adaptada para JEPA
 # Se utilizó como referencia y se reutilizaron cosas de: https://github.com/zhechencai/WaveViT/blob/main/classification/wavevit.py#L159
 class WaveletAttention(nn.Module):

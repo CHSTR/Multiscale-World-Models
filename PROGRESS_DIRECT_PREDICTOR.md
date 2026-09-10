@@ -120,3 +120,62 @@ e.g. for `history_size: 3` and `num_preds: 5` → `num_frames: 7` (the documente
 minimum). With `num_frames < history_size + num_preds - 1`, `rollout` /
 `predict(n_future>0)` crashes on `pos_embedding`. The `num_preds` value also must
 not exceed the planning horizon a rollout requests.
+
+---
+
+# P1 — direct-predictor yamls (asym, frozen DINOv3) — VERIFIED GREEN
+
+Two new yamls under `config/train/model/`:
+- `dinov3_direct_sym.yaml` — main sweep point, `num_preds: 5`, `predictor.num_frames: 7`.
+- `dinov3_ar_sym.yaml` — control, `num_preds: 1`, `predictor.num_frames: 3` (reduces
+  to the plain AR forward through the `asym` path).
+
+Both are `AsymJEPA` + frozen DinoV3 encoder (`n_in=1, n_tgt=0, tie_tgt_to_in`) +
+`MaskedPredictor`; `projector_in`/`projector_tgt`/`pred_proj` are `module.MLP` with
+`BatchNorm1d` as `norm_fn`.
+
+## Full verification — GREEN
+Script: `.tmp_verify/verify_direct_pred.py` (compose Hydra → `instantiate(cfg.model)`
+→ `train.asym_forward` with a synthetic batch; deletes itself at the end).
+Run: `/home/chr/le-wm/.venv/bin/python .tmp_verify/verify_direct_pred.py`
+
+- `compose(config_name="lewm", overrides=["model=<name>"])` OK.
+- `instantiate(AsymJEPA)` OK after popping the non-constructor `forward` key and
+  pointing `encoder.ckpt_path` at the local file.
+- `asym_forward` with a synthetic batch (finite losses):
+  - `dinov3_direct_sym` (P1): `num_frames=7`, `num_preds=5`, `B=2, T=8, H=5` →
+    `pred_loss=0.279490`, `sigreg_loss=0.773609`, `loss=0.349115` (all finite).
+  - `dinov3_ar_sym` (control): `num_frames=3`, `num_preds=1`, `B=2, T=4, H=1` →
+    `pred_loss=0.292421`, `sigreg_loss=0.765882`, `loss=0.361350` (all finite).
+- The `projector_tgt` path is exercised end-to-end: `tok_tgt` is **3D**
+  `(BT, K, 384)` (K=1 because `tie_tgt_to_in`), so this fix is what makes the
+  `BatchNorm1d` MLP run at all (see below).
+
+## Fix — `module.py::MLP.forward` (flatten leading dims to 2D)
+`projector_tgt` receives a **3D** token tensor `(BT, K, 384)`. The previous
+`forward` was `return self.net(x)`, which **crashes** for a `BatchNorm1d` MLP:
+`nn.Linear` promotes `(BT,1,384)`→`(BT,1,2048)` and `BatchNorm1d` reads that as
+`(N, C=1, L=2048)`, so `running_mean` (2048) ≠ channel dim (1):
+`RuntimeError: running_mean should contain 1 elements not 2048`.
+
+Fix (option (a) — approved): flatten the leading dims to 2D before `net`, restore
+them after, so `BatchNorm1d` (and `Linear`) always see `(N, C=D)`. Layer order /
+architecture unchanged:
+
+```python
+def forward(self, x):
+    orig_shape = x.shape
+    x2d = x.reshape(-1, x.shape[-1])
+    out2d = self.net(x2d)
+    return out2d.reshape(orig_shape[:-1] + (out2d.shape[-1],))
+```
+
+- **2D inputs are a no-op view** (`x.reshape(-1, D) == x`, final reshape is a no-op)
+  → **bit-identical**. Verified `max|diff| = 0.0` for both `LayerNorm` and
+  `BatchNorm1d` MLPs (standalone `/tmp/mlp_check.py`).
+- **3D `(BT,K,D)` now enabled**: per-feature `BatchNorm1d` over the full `BT*K`
+  samples (== manual `net(flatten).unflatten`).
+- **Tie case (K=1) is bit-identical to 2D**: end-to-end on the real
+  `dinov3_direct_sym` model, `emb_tgt` (3D) == `net(flatten(tok_tgt))` unflattened
+  with `max|diff| = 0.0`; `emb_in` (2D) == `net(tok_in)` with `max|diff| = 0.0`.
+- Only `module.py` touched; no yaml / arch changes.

@@ -236,9 +236,21 @@ class MLP(nn.Module):
 
     def forward(self, x):
         """
-        x: (B*T, D)
+        x: (B, D) 2D, or (BT, K, D) 3D (e.g. ``projector_tgt`` over target
+        tokens).
+
+        The leading dimensions are flattened to 2D ``(B*..., D)`` so that a
+        ``BatchNorm1d`` inside ``net`` always receives ``(N, C)`` with the
+        feature dim ``C`` as the last axis; the original leading shape is then
+        restored on the output. The layer order/architecture is unchanged.
+
+        For 2D inputs this is a no-op view, so the output is bit-identical to
+        running ``net`` directly on ``x``.
         """
-        return self.net(x)
+        orig_shape = x.shape
+        x2d = x.reshape(-1, x.shape[-1])
+        out2d = self.net(x2d)
+        return out2d.reshape(orig_shape[:-1] + (out2d.shape[-1],))
 
 
 class ARPredictor(nn.Module):

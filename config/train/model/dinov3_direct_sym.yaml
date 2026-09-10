@@ -1,0 +1,84 @@
+# P1 — direct predictor, asymmetric (n-step) forward.
+#
+# AsymJEPA with a *frozen* DinoV3 encoder (single prompt: n_in=1, n_tgt=0,
+# tie_tgt_to_in) and a MaskedPredictor that predicts (num_preds-1) future
+# frames in one shot. This is the main sweep point: a multi-frame look-ahead.
+#
+# Because the masked predictor slices pos_embedding[:, :T] (T = number of
+# frames it receives) and asym_forward needs the full look-ahead horizon in a
+# single shot, the predictor needs:
+#     num_frames >= history_size + num_preds - 1  ==  3 + 5 - 1  ==  7
+# (literal value = the documented minimum with the default hyper-params).
+_target_: jepa_asym.AsymJEPA
+
+# Signal train.py to select train.asym_forward (cfg.model.forward == "asym").
+forward: asym
+# Planning horizon this run trains on (also passed to AsymJEPA).
+num_preds: 5
+
+encoder:
+  _target_: src.encoders.dinov3_encoder.DinoV3Encoder
+  pretrained: true
+  # null = portable: usa $DINOV3_CKPT si existe, si no descarga por hub oficial.
+  # Override: model.encoder.ckpt_path=/ruta/al/pth
+  ckpt_path: null
+  img_size: ${img_size}
+  in_chans: 3              # RGB. Use 15 for the starlet variants (*_starlet_lora).
+  lora_r: 0                # frozen backbone
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_targets: ["qkv", "proj"]
+  # Direct-predictor contract: single prompt (n_in=1, n_tgt=0), tied target.
+  n_in_tokens: 1
+  n_tgt_tokens: 0
+  tie_tgt_to_in: true
+  starlet_levels: 0
+  freeze_mode: all         # 100% frozen backbone
+
+predictor:
+  _target_: module.MaskedPredictor
+  num_frames: 7            # >= history_size + num_preds - 1 = 7
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+# Separate input projector 384 (encoder) -> ${embed_dim} (workspace).
+projector_in:
+  _target_: module.MLP
+  input_dim: 384
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# Separate target projector 384 (encoder) -> ${embed_dim} (workspace).
+projector_tgt:
+  _target_: module.MLP
+  input_dim: 384
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# Predictor head ${embed_dim} -> ${embed_dim}.
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

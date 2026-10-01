@@ -89,3 +89,15 @@ def test_proto_yaml_instantiates():
     h = torch.randn(2, 3, 192)
     logits, pi, z = head(h)
     assert z.shape == (2, 3, 192)
+
+
+def test_sinkhorn_flattens_leading_dims():
+    from module import sinkhorn
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 2, 64) / 0.1
+    q = sinkhorn(x, eps=0.05, iters=3)
+    q_flat = sinkhorn(x.reshape(-1, 64), eps=0.05, iters=3).reshape(4, 2, 64)
+    assert q.shape == (4, 2, 64)
+    assert torch.allclose(q.sum(-1), torch.ones(4, 2), atol=1e-3)
+    assert torch.allclose(q, q_flat, atol=1e-6)

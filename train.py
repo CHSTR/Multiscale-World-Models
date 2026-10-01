@@ -44,19 +44,19 @@ def lejepa_forward(self, batch, stage, cfg):
         z_emb, proto_logits = self.model.predict_proto(ctx_emb, ctx_act)
         with torch.no_grad():
             proto_c = proto_head.prototypes.detach()
-        pl = _proto_losses(
+        proto_out = _proto_losses(
             z_emb, proto_logits, tgt_emb, proto_c,
             tau=proto_cfg.get("tau", 0.1), eps=proto_cfg.get("eps", 0.05),
             iters=proto_cfg.get("iters", 3),
             weight_mse=proto_cfg.get("weight_mse", 1.0),
             weight_ce=proto_cfg.get("weight_ce", 1.0),
         )
-        output["pred_loss"] = pl["mse"]
-        output["proto_ce_loss"] = pl["ce"]
+        output["pred_loss"] = proto_out["mse"]
+        output["proto_ce_loss"] = proto_out["ce"]
         output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
-        output["loss"] = pl["loss"] + lambd * output["sigreg_loss"]
-        self.log(f"{stage}/proto_perplexity", pl["perplexity"], on_step=True, sync_dist=True)
-        self.log(f"{stage}/proto_entropy", pl["entropy"], on_step=True, sync_dist=True)
+        output["loss"] = proto_out["loss"] + lambd * output["sigreg_loss"]
+        self.log(f"{stage}/proto_perplexity", proto_out["perplexity"], on_step=True, sync_dist=True)
+        self.log(f"{stage}/proto_entropy", proto_out["entropy"], on_step=True, sync_dist=True)
     else:
         pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
 

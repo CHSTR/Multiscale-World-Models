@@ -443,16 +443,21 @@ def sinkhorn(scores: torch.Tensor, eps: float = 0.05, iters: int = 3) -> torch.T
     """Asignación balanceada estilo Sinkhorn, sin gradiente.
 
     Convención fijada: devuelve matriz row-stochastic (cada fila suma 1).
-    Itera normalización fila/columna y termina con norma por fila.
+    El balanceo se hace global sobre todas las muestras (aplana las dims
+    líderes a (N, K)): con entrada (B, T, K) NO se balancea por slice de T,
+    porque frames correlacionados del mismo rollout no deben repartirse a
+    la fuerza entre prototipos.
     """
-    q = torch.exp((scores.detach().float() / eps).clamp(-50.0, 50.0)).clamp_min(1e-12)
-    n_rows, n_cols = q.shape[-2], q.shape[-1]
+    shape = scores.shape
+    k = shape[-1]
+    q = torch.exp((scores.detach().float().reshape(-1, k) / eps).clamp(-50.0, 50.0)).clamp_min(1e-12)
+    n_rows = q.shape[0]
     for _ in range(max(1, int(iters))):
         q = q / q.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         q = q / q.sum(dim=-2, keepdim=True).clamp_min(1e-12)
-        q = q * (n_rows / n_cols)
+        q = q * (n_rows / k)
     q = q / q.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    return q
+    return q.reshape(shape)
 
 
 class PrototypeHead(nn.Module):

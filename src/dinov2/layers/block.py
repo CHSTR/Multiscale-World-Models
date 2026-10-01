@@ -98,10 +98,15 @@ class Block(nn.Module):
 
         def attn_residual_func(x: Tensor) -> Tensor:
             if isinstance(self.attn, MemEffAttention):
-                attn_output = self.attn(self.norm1(x))[0]
+                # BUGFIX: MemEffAttention devuelve un tensor (B, N, C), no una tupla. El ``[0]`` que
+                # había aquí tomaba la atención de la PRIMERA imagen del batch y la sumaba (por
+                # broadcasting) a todas: el CLS de cada imagen era el de la imagen 0.
+                attn_output = self.attn(self.norm1(x))
             else:
-                # PlainMultiheadAttentionLoRA
-                attn_output = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+                # PlainMultiheadAttentionLoRA (estilo nn.MultiheadAttention: devuelve (out, pesos))
+                attn_output = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
+            if isinstance(attn_output, tuple):
+                attn_output = attn_output[0]
             return self.ls1(attn_output)
 
         def ffn_residual_func(x: Tensor) -> Tensor:

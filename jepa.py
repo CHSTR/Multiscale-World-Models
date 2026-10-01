@@ -17,6 +17,7 @@ class JEPA(nn.Module):
         action_encoder,
         projector=None,
         pred_proj=None,
+        proto_head=None,
     ):
         super().__init__()
 
@@ -25,6 +26,7 @@ class JEPA(nn.Module):
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
+        self.proto_head = proto_head
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
@@ -53,6 +55,19 @@ class JEPA(nn.Module):
         preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
         preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
         return preds
+
+    def predict_proto(self, emb, act_emb):
+        """Predict con cabeza de prototipos (solo entrenamiento, Etapa 1 frame).
+
+        emb: (B, T, D), act_emb: (B, T, A_emb).
+        Devuelve (z, logits): z (B, T, D) continuo en el espacio del target,
+        logits (B, T, K). `predict` queda intacto para rollout/planning.
+        """
+        if self.proto_head is None:
+            raise RuntimeError("proto_head no configurado")
+        h = self.predict(emb, act_emb)
+        logits, _pi, z = self.proto_head(h)
+        return z, logits
 
     ####################
     ## Inference only ##

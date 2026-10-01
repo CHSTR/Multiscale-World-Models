@@ -64,3 +64,17 @@ def test_predict_proto_none_head_raises_but_predict_works():
     assert jepa.predict(emb, act).shape == (2, 3, 16)
     with pytest.raises(RuntimeError):
         jepa.predict_proto(emb, act)
+
+
+def test_proto_loss_terms_finite():
+    from module import _proto_losses as proto_losses
+
+    out = proto_losses(
+        z=torch.randn(4, 2, 16), logits=torch.randn(4, 2, 64),
+        tgt=torch.randn(4, 2, 16),
+        prototypes=torch.randn(64, 16), tau=0.1, eps=0.05, iters=3,
+    )
+    assert torch.isfinite(out["mse"]) and torch.isfinite(out["ce"])
+    assert out["loss"] == out["mse"] + out["ce"]  # pesos 1.0 en el helper
+    assert torch.isfinite(out["perplexity"]) and out["perplexity"] > 1.0
+    assert torch.isfinite(out["entropy"]) and out["entropy"] > 0.0

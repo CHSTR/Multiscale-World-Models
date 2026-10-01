@@ -476,3 +476,27 @@ class PrototypeHead(nn.Module):
         pi = logits.softmax(dim=-1)
         z = pi @ c
         return logits.to(dtype), pi.to(dtype), z.to(dtype)
+
+
+def _proto_losses(z, logits, tgt, prototypes, tau=0.1, eps=0.05, iters=3,
+                  weight_mse=1.0, weight_ce=1.0):
+    """Pérdida proto frame-level (puro torch; `train.py` la usa en `lejepa_forward`).
+
+    Target con stop-grad: scores = norm(tgt) @ norm(C).T / tau, q = sinkhorn.
+    Todo en float32 aunque el modelo corra en bf16.
+    Devuelve dict(mse, ce, loss, q, perplexity, entropy).
+    """
+    mse = F.mse_loss(z.float(), tgt.float())
+    with torch.no_grad():
+        c = F.normalize(prototypes.float(), dim=1)
+        t = F.normalize(tgt.float(), dim=-1)
+        scores = (t @ c.t()) / tau
+        q = sinkhorn(scores, eps=eps, iters=iters)
+    logp = F.log_softmax(logits.float(), dim=-1)
+    ce = -(q * logp).sum(-1).mean()
+    p_mean = q.mean(dim=tuple(range(q.dim() - 1))).clamp_min(1e-12)
+    entropy = -(p_mean * p_mean.log()).sum()
+    perplexity = torch.exp(entropy)
+    loss = weight_mse * mse + weight_ce * ce
+    return {"mse": mse, "ce": ce, "loss": loss, "q": q,
+            "perplexity": perplexity, "entropy": entropy}

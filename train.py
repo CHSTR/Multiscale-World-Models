@@ -11,7 +11,7 @@ import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
-from module import SIGReg
+from module import SIGReg, _proto_losses
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback, StarletVisCallback
 
 
@@ -34,12 +34,36 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_act = act_emb[:, : ctx_len]
 
     tgt_emb = emb[:, n_preds:] # label
-    pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
 
-    # LeWM loss
-    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+    # Etapa 1 proto (frame-level SwAV): si el modelo trae proto_head y el
+    # config trae loss.proto, el término MSE usa ẑ de predict_proto y se suma
+    # CE contra el target Sinkhorn (no-grad). Sin head el camino es el de antes.
+    proto_head = getattr(self.model, "proto_head", None)
+    proto_cfg = getattr(cfg.loss, "proto", None)
+    if proto_head is not None and proto_cfg is not None:
+        z_emb, proto_logits = self.model.predict_proto(ctx_emb, ctx_act)
+        with torch.no_grad():
+            proto_c = proto_head.prototypes.detach()
+        pl = _proto_losses(
+            z_emb, proto_logits, tgt_emb, proto_c,
+            tau=proto_cfg.get("tau", 0.1), eps=proto_cfg.get("eps", 0.05),
+            iters=proto_cfg.get("iters", 3),
+            weight_mse=proto_cfg.get("weight_mse", 1.0),
+            weight_ce=proto_cfg.get("weight_ce", 1.0),
+        )
+        output["pred_loss"] = pl["mse"]
+        output["proto_ce_loss"] = pl["ce"]
+        output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
+        output["loss"] = pl["loss"] + lambd * output["sigreg_loss"]
+        self.log(f"{stage}/proto_perplexity", pl["perplexity"], on_step=True, sync_dist=True)
+        self.log(f"{stage}/proto_entropy", pl["entropy"], on_step=True, sync_dist=True)
+    else:
+        pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
+
+        # LeWM loss
+        output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+        output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
+        output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     encoder = getattr(self.model, "encoder", None)

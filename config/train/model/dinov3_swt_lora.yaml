@@ -1,0 +1,67 @@
+# DINOv3 + LoRA con front-end SWT (3 orientaciones por nivel + LL).
+#
+# La SWT no suma la imagen, así que no existe una init "equivalente" en modo replace:
+# por defecto usa fusion=residual (RGB preentrenado + rama SWT inicializada en cero),
+# que reproduce exactamente a DINO en el paso 0. Con J=3 la rama recibe 3*(3*3+1)=30 canales.
+_target_: jepa.JEPA
+
+encoder:
+  _target_: src.encoders.dinov3_encoder.DinoV3Encoder
+  pretrained: true
+  # null = portable: usa $DINOV3_CKPT si existe, si no descarga por hub oficial.
+  ckpt_path: null
+  img_size: ${img_size}
+  starlet_levels: 0
+  starlet_filter: b3
+  starlet_learnable_weights: true
+  # --- front-end multiescala (src/encoders/multiscale.py; defaults = comportamiento previo) ---
+  frontend: swt             # auto | none | starlet | swt | rgb_repeat | random
+  frontend_levels: 3           # J (null = starlet_levels)
+  swt_filter: bior2.2
+  swt_merge_orientations: false   # true = suma LH+HL+HH por nivel (ablación de orientación)
+  random_kernel: 9
+  random_seed: 0
+  fusion: residual            # replace | residual (rama multiescala inicializada en cero)
+  patch_init: legacy            # legacy (original) | equivalent (W_rgb replicado: exacto en el paso 0)
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_targets: ["qkv", "proj"]
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+# Projector 384 (encoder) -> ${embed_dim} (workspace).
+projector:
+  _target_: module.MLP
+  input_dim: 384
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# Predictor head ${embed_dim} -> ${embed_dim}.
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

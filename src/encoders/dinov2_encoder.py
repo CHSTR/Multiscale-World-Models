@@ -31,18 +31,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from wavelet.starlet_torch import starlet_conv4d
+from src.encoders.multiscale import MultiscaleFrontendMixin
 
 from src.encoders.vit_lora import (
     apply_lora_to_vit,
     count_total_parameters,
     count_trainable_parameters,
-    expand_patch_embed,
     freeze_except_lora_norm_patch,
 )
 
 
-class DinoV2Encoder(nn.Module):
+class DinoV2Encoder(MultiscaleFrontendMixin, nn.Module):
     """ViT-small / patch-14 (dim 384) DINOv2 encoder with optional LoRA + multicanal patch embed."""
 
     def __init__(
@@ -55,6 +54,14 @@ class DinoV2Encoder(nn.Module):
         starlet_levels: int = 0,
         starlet_filter: str = "b3",
         starlet_learnable_weights: bool = True,
+        frontend: str = "auto",
+        frontend_levels: Optional[int] = None,
+        swt_filter: str = "bior2.2",
+        swt_merge_orientations: bool = False,
+        random_kernel: int = 9,
+        random_seed: int = 0,
+        fusion: str = "replace",
+        patch_init: str = "legacy",
         lora_r: int = 8,
         lora_alpha: float = 16,
         lora_dropout: float = 0.1,
@@ -65,17 +72,15 @@ class DinoV2Encoder(nn.Module):
         self.img_size = img_size
         self.embed_dim = 384
         self.patch_embed_mode = patch_embed_mode
-        # Frontend starlet (igual que wavelet.starlet_encoder.StarletEncoder):
-        # el int manda y deriva in_chans = 3*(L+1).
-        self.starlet_levels = int(starlet_levels)
-        self.starlet_filter = starlet_filter
-        if self.starlet_levels > 0:
-            in_chans = 3 * (self.starlet_levels + 1)
-            w = torch.ones(self.starlet_levels + 1)
-            if starlet_learnable_weights:
-                self.level_weights = nn.Parameter(w)
-            else:
-                self.register_buffer("level_weights", w)
+        # Front-end multiescala (ver src/encoders/multiscale.py). Con los defaults es idéntico al
+        # comportamiento previo: starlet_levels > 0 => Starlet con in_chans = 3*(L+1).
+        in_chans = self._init_frontend(
+            frontend=frontend, frontend_levels=frontend_levels, starlet_levels=starlet_levels,
+            starlet_filter=starlet_filter, starlet_learnable_weights=starlet_learnable_weights,
+            swt_filter=swt_filter, swt_merge_orientations=swt_merge_orientations,
+            random_kernel=random_kernel, random_seed=random_seed, fusion=fusion,
+            patch_init=patch_init, in_chans=in_chans,
+        )
         self.in_chans = in_chans
 
         from src.dinov2.hub.backbones import dinov2_vits14
@@ -103,8 +108,7 @@ class DinoV2Encoder(nn.Module):
             _interp_pos_embed_to_target(state_dict, self.model)
             self.model.load_state_dict(state_dict, strict=False)
 
-        if in_chans > 3 and patch_embed_mode == "adapt":
-            expand_patch_embed(self.model, in_chans, fill="mean")
+        self._setup_patch_embed(in_chans)
 
         self._lora_layers = apply_lora_to_vit(
             self.model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout, targets=lora_targets
@@ -114,16 +118,14 @@ class DinoV2Encoder(nn.Module):
         self.to(device)
         print(
             f"DinoV2Encoder(vits14, dim={self.embed_dim}, in_chans={in_chans}, "
-            f"starlet_levels={self.starlet_levels}, lora_layers={len(self._lora_layers)}) "
+            f"frontend={self.frontend_kind}(J={self.frontend_levels}, fusion={self.fusion}, init={self.patch_init}), lora_layers={len(self._lora_layers)}) "
             f"[trainable={count_trainable_parameters(self):,}/{count_total_parameters(self):,} params]"
         )
 
     def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = True,
                 prompt: Optional[torch.Tensor] = None, **kwargs):
         """Return an object exposing ``last_hidden_state`` ``(B, 1+N, 384)`` (CLS first)."""
-        x = pixel_values
-        if self.starlet_levels > 0:
-            x = starlet_conv4d(x, self.starlet_levels, scale=self.level_weights, filter=self.starlet_filter)
+        x = self._frontend_input(pixel_values)
         # ``is_training=True`` makes the backbone return the feature dict, from
         # which we assemble the full (normed) token sequence with CLS first.
         features = self.model(x, prompt=prompt, is_training=True)

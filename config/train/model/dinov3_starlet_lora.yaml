@@ -19,6 +19,15 @@ encoder:
   starlet_levels: 3        # 3 niveles => in_chans = 3*4 = 12 (derivado solo)
   starlet_filter: b3
   starlet_learnable_weights: true
+  # --- front-end multiescala (src/encoders/multiscale.py; defaults = comportamiento previo) ---
+  frontend: auto            # auto | none | starlet | swt | rgb_repeat | random
+  frontend_levels: null        # J (null = starlet_levels)
+  swt_filter: bior2.2
+  swt_merge_orientations: false   # true = suma LH+HL+HH por nivel (ablación de orientación)
+  random_kernel: 9
+  random_seed: 0
+  fusion: replace             # replace | residual (rama multiescala inicializada en cero)
+  patch_init: legacy            # legacy (original) | equivalent (W_rgb replicado: exacto en el paso 0)
   lora_r: 8
   lora_alpha: 16
   lora_dropout: 0.1

@@ -1,9 +1,10 @@
 from torch import nn
 
+from .frontend import BandAblationMixin, band_names
 from .swt_torch import swt_conv4d
 
 
-class SWTEncoder(nn.Module):
+class SWTEncoder(BandAblationMixin, nn.Module):
     """Frontend que reemplaza RGB con coeficientes wavelet orientados SWT.
 
     pixel_values : (B, 3, H, W) → SWT produce (B, 3·(3*levels+1), H, W)
@@ -34,7 +35,15 @@ class SWTEncoder(nn.Module):
         vit.config.num_channels = new_in_c
         vit.embeddings.patch_embeddings.num_channels = new_in_c
 
+    @property
+    def band_names(self):
+        return band_names("swt", self.levels)
+
     def forward(self, pixel_values, **kwargs):
         x = swt_conv4d(pixel_values, self.levels, filter=self.filter)  # (B, 3·(3L+1), H, W)
+        if getattr(self, "_band_ablation", None) is not None or getattr(self, "_band_scale", None) is not None:
+            B, _, H, W = x.shape
+            bands = self._apply_band_controls(x.view(B, 3 * self.levels + 1, -1, H, W))
+            x = bands.flatten(1, 2)
         x = self.channel_proj(x)                                      # (B, 3·(L+1), H, W)
         return self.vit(x, **kwargs)

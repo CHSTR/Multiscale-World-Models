@@ -62,6 +62,11 @@ python viz/generate_attention_gif.py \
   --output-dir outputs/attn
 ```
 
+## Diagnóstico multiescala
+
+Experimentos para medir si, por qué y en qué afecta la multiescala (init equivalente, fusión residual,
+controles de capacidad, ablación de bandas, probes, estadística pareada): ver [EXPERIMENTOS.md](EXPERIMENTOS.md).
+
 ## Estructura
 
 ```

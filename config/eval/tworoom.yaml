@@ -43,3 +43,14 @@ eval:
 
 output:
   filename: tworoom_results.txt
+  tag: null              # nombre de la condición en trazas/jsonl (por defecto se deriva)
+
+# Diagnóstico multiescala (ver EXPERIMENTOS.md)
+ablation:
+  bands: null    # p. ej. [w1], [c3], [details], [LH1,HL1,HH1] o índices [0]
+  mode: zero     # zero | mean | noise
+
+perturb:
+  kind: none     # none | blur | noise | downsample | brightness
+  strength: 0.0  # sigma (blur), std en [0,1] (noise), factor (downsample), delta (brightness)
+  goal: true     # aplicar también a la imagen goal

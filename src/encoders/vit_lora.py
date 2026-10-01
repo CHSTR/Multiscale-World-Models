@@ -193,7 +193,7 @@ def _find_patch_embed(model: nn.Module):
     raise AttributeError("No patch-embedding module found (looked for PatchEmbed / .patch_embed / .patch_embeddings)")
 
 
-def expand_patch_embed(model: nn.Module, in_chans: int, fill: str = "mean") -> None:
+def expand_patch_embed(model: nn.Module, in_chans: int, fill: str = "mean", copy_bias: bool = False) -> None:
     """Expand a ViT's patch-embedding conv to ``in_chans`` input channels.
 
     The new conv keeps the original ``out_channels`` / kernel / stride and has
@@ -202,6 +202,15 @@ def expand_patch_embed(model: nn.Module, in_chans: int, fill: str = "mean") -> N
     (``fill="mean"``) or zeros (``fill="zeros"``). This mirrors the pattern used
     in ``wavelet/starlet_encoder.py`` so wavelet / starlet frontends can feed a
     DINO encoder unchanged. The (new) conv is left trainable.
+
+    ``fill="repeat"`` replica los pesos RGB en cada grupo de ``old_in`` canales
+    (requiere ``in_chans % old_in == 0``). Si la entrada son bandas que suman la
+    imagen (Starlet), conv(W, sum_b band_b) = conv(W, x): el encoder reproduce
+    exactamente al preentrenado en el paso 0 (``patch_init=equivalent``, que usa
+    además ``copy_bias=True``).
+
+    Nota: con ``fill="zeros"`` el código original no ponía nada en cero (el conv nuevo
+    trae init aleatoria); ahora sí los pone en cero.
     """
     patch_embed = _find_patch_embed(model)
     conv = getattr(patch_embed, "proj")
@@ -221,10 +230,22 @@ def expand_patch_embed(model: nn.Module, in_chans: int, fill: str = "mean") -> N
         bias=conv.bias is not None,
     )
     with torch.no_grad():
-        new_conv.weight[:, :old_in].copy_(old_weight)
-        if fill == "mean":
-            new_conv.weight[:, old_in:].copy_(old_weight.mean(dim=1, keepdim=True))
-        # "zeros" leaves the extra channels at zero (safe: acts as RGB-only path)
+        if fill == "repeat":
+            if in_chans % old_in != 0:
+                raise ValueError(f"fill='repeat' requiere in_chans ({in_chans}) múltiplo de {old_in}")
+            new_conv.weight.copy_(old_weight.repeat(1, in_chans // old_in, 1, 1))
+        else:
+            new_conv.weight[:, :old_in].copy_(old_weight)
+            if fill == "mean":
+                new_conv.weight[:, old_in:].copy_(old_weight.mean(dim=1, keepdim=True))
+            elif fill == "zeros":
+                new_conv.weight[:, old_in:].zero_()
+            else:
+                raise ValueError(f"fill desconocido: {fill!r}")
+        # El comportamiento original NO copiaba el bias (queda con init aleatoria): se conserva
+        # por defecto para que las corridas "legacy" sean reproducibles.
+        if copy_bias and conv.bias is not None:
+            new_conv.bias.copy_(conv.bias)
 
     # Replace in-place. ``patch_embed`` is a live reference from .modules().
     setattr(patch_embed, "proj", new_conv)

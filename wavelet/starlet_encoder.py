@@ -1,10 +1,11 @@
 import torch
 from torch import nn
 
+from .frontend import BandAblationMixin, band_names
 from .starlet_torch import starlet_conv4d
 
 
-class StarletEncoder(nn.Module):
+class StarletEncoder(BandAblationMixin, nn.Module):
     """Frontend that replaces RGB with (levels+1)×RGB wavelet coefficients.
     """
 
@@ -35,9 +36,18 @@ class StarletEncoder(nn.Module):
         vit.embeddings.patch_embeddings.num_channels = new_in_c
         with torch.no_grad():
             new_conv = vit.embeddings.patch_embeddings.projection
-            # ponytail: reuse old RGB weights for first-level channels; rest starts zero.
+            # Reusa los pesos RGB en los canales de w_1 (el detalle más fino); el resto queda con la
+            # init aleatoria por defecto de nn.Conv2d (no en cero). En un ViT desde cero da igual.
             new_conv.weight[:, :old_pe.in_channels].copy_(old_pe.weight)
+
+    @property
+    def band_names(self):
+        return band_names("starlet", self.levels)
 
     def forward(self, pixel_values, **kwargs):
         x = starlet_conv4d(pixel_values, self.levels, scale=self.level_weights, filter=self.filter)
+        if getattr(self, "_band_ablation", None) is not None or getattr(self, "_band_scale", None) is not None:
+            B, _, H, W = x.shape
+            bands = self._apply_band_controls(x.view(B, self.levels + 1, -1, H, W))
+            x = bands.flatten(1, 2)
         return self.vit(x, **kwargs)

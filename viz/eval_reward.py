@@ -4,6 +4,7 @@ import sys
 os.environ["MUJOCO_GL"] = "egl"
 sys.path.insert(0, __file__[:__file__.rfind("/viz")])
 
+import json
 import time
 from pathlib import Path
 
@@ -16,17 +17,53 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 from viz.eval_traces import evaluate_with_traces, save_traces, format_summary
+from diagnostics.perturb import ImagePerturbation
 
-def img_transform(cfg):
-    transform = transforms.Compose(
-        [
-            transforms.ToImage(),
-            transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(**spt.data.dataset_stats.ImageNet),
-            transforms.Resize(size=cfg.eval.img_size),
-        ]
-    )
-    return transform
+
+def img_transform(cfg, perturb: bool = False):
+    """ToImage -> [0, 1] -> (perturbación opcional) -> Normalize ImageNet -> Resize."""
+    steps = [transforms.ToImage(), transforms.ToDtype(torch.float32, scale=True)]
+    pcfg = cfg.get("perturb") or {}
+    if perturb and pcfg.get("kind", "none") != "none":
+        steps.append(ImagePerturbation(pcfg.get("kind"), pcfg.get("strength", 0.0), seed=cfg.seed))
+    steps += [
+        transforms.Normalize(**spt.data.dataset_stats.ImageNet),
+        transforms.Resize(size=cfg.eval.img_size),
+    ]
+    return transforms.Compose(steps)
+
+
+def apply_band_ablation(model, cfg) -> list | None:
+    """Ablación de bandas del front-end en test (ej. ablation.bands=[w1] ablation.mode=zero)."""
+    acfg = cfg.get("ablation") or {}
+    bands = acfg.get("bands")
+    if bands is None or (hasattr(bands, "__len__") and len(bands) == 0):
+        return None
+    enc = model.encoder
+    if not hasattr(enc, "set_band_ablation"):
+        raise ValueError(f"{type(enc).__name__} no soporta ablación de bandas")
+    bands = list(bands) if not isinstance(bands, (str, int)) else [bands]
+    idx = enc.set_band_ablation(bands, mode=acfg.get("mode", "zero"), seed=cfg.seed)
+    names = [enc.band_names[i] for i in idx]
+    print(f"[ablation] bandas {names} (idx={idx}) modo={acfg.get('mode', 'zero')}")
+    return names
+
+
+def run_tag(cfg) -> str:
+    """Etiqueta legible de la condición evaluada (para nombrar trazas y filas del jsonl)."""
+    tag = (cfg.get("output") or {}).get("tag")
+    if tag:
+        return str(tag)
+    parts = []
+    acfg = cfg.get("ablation") or {}
+    if acfg.get("bands") is not None:
+        b = acfg["bands"]
+        b = [b] if isinstance(b, (str, int)) else list(b)
+        parts.append(f"abl-{acfg.get('mode', 'zero')}-" + "+".join(map(str, b)))
+    pcfg = cfg.get("perturb") or {}
+    if pcfg.get("kind", "none") != "none":
+        parts.append(f"{pcfg['kind']}{pcfg.get('strength', 0)}")
+    return "_".join(parts) or "clean"
 
 
 def get_episodes_length(dataset, episodes):
@@ -60,10 +97,11 @@ def run(cfg: DictConfig):
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
     world = swm.World(**cfg.world, image_shape=(224, 224))
 
-    # create the transform
+    # create the transform (la perturbación de robustez aplica a observaciones y, si perturb.goal, al goal)
+    pcfg = cfg.get("perturb") or {}
     transform = {
-        "pixels": img_transform(cfg),
-        "goal": img_transform(cfg),
+        "pixels": img_transform(cfg, perturb=True),
+        "goal": img_transform(cfg, perturb=bool(pcfg.get("goal", True))),
     }
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
@@ -93,6 +131,7 @@ def run(cfg: DictConfig):
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
+        ablated = apply_band_ablation(model, cfg)
         config = swm.PlanConfig(**cfg.plan_config)
         solver = hydra.utils.instantiate(cfg.solver, model=model)
         policy = swm.policy.WorldModelPolicy(
@@ -101,6 +140,7 @@ def run(cfg: DictConfig):
 
     else:
         policy = swm.policy.RandomPolicy()
+        ablated = None
 
     results_path = (
         Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
@@ -157,7 +197,36 @@ def run(cfg: DictConfig):
     metrics = results["aggregate"]
     print(metrics)
 
-    save_traces(results_path / "traces.npz", results)
+    # Claves para emparejar episodios entre modelos (mismo seed => mismos estados iniciales y goals).
+    n_ep = len(eval_episodes)
+    results["per_episode"]["episode_idx"] = np.asarray(eval_episodes)
+    results["per_episode"]["start_step"] = np.asarray(eval_start_idx)
+    results["per_episode"]["eval_seed"] = np.full(n_ep, cfg.seed)
+
+    tag = run_tag(cfg)
+    stem = Path(str(cfg.policy)).stem if cfg.policy != "random" else "random"
+    traces_path = results_path / f"traces_{stem}_{tag}_seed{cfg.seed}.npz"
+    save_traces(traces_path, results)
+
+    record = {
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "policy": str(cfg.policy),
+        "env": str(cfg.world.env_name),
+        "tag": tag,
+        "seed": int(cfg.seed),
+        "ablation": ablated,
+        "ablation_mode": (cfg.get("ablation") or {}).get("mode"),
+        "perturb": OmegaConf.to_container(cfg.perturb, resolve=True) if cfg.get("perturb") else None,
+        "num_eval": int(cfg.eval.num_eval),
+        "goal_offset_steps": int(cfg.eval.goal_offset_steps),
+        "eval_budget": int(cfg.eval.eval_budget),
+        "plan_horizon": int(cfg.plan_config.horizon),
+        "solver_num_samples": int(cfg.solver.get("num_samples", -1)) if cfg.get("solver") else None,
+        "traces": str(traces_path),
+        **{k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in metrics.items()},
+    }
+    with (results_path / "results.jsonl").open("a") as f:
+        f.write(json.dumps(record) + "\n")
 
     results_path = results_path / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)

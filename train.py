@@ -42,8 +42,13 @@ def lejepa_forward(self, batch, stage, cfg):
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
-    if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'level_weights'):
-        for i, w in enumerate(self.model.encoder.level_weights):
+    encoder = getattr(self.model, "encoder", None)
+    if encoder is not None and hasattr(encoder, "frontend_stats"):
+        # Pesos por banda (con nombre) y ||rama multiescala|| / ||rama RGB|| en fusión residual.
+        for k, v in encoder.frontend_stats().items():
+            losses_dict[f"{stage}/{k}"] = v.detach() if torch.is_tensor(v) else v
+    elif encoder is not None and hasattr(encoder, "level_weights"):
+        for i, w in enumerate(encoder.level_weights):
             losses_dict[f"{stage}/level_weight_{i}"] = w.detach()
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output

@@ -436,3 +436,43 @@ if __name__ == "__main__":
     assert x.grad is not None and torch.isfinite(x.grad).all()
     print("backward OK")
     print("WaveletAttention self-check completo")
+
+
+@torch.no_grad()
+def sinkhorn(scores: torch.Tensor, eps: float = 0.05, iters: int = 3) -> torch.Tensor:
+    """Asignación balanceada estilo Sinkhorn, sin gradiente.
+
+    Convención fijada: devuelve matriz row-stochastic (cada fila suma 1).
+    Itera normalización fila/columna y termina con norma por fila.
+    """
+    q = torch.exp((scores.detach().float() / eps).clamp(-50.0, 50.0)).clamp_min(1e-12)
+    n_rows, n_cols = q.shape[-2], q.shape[-1]
+    for _ in range(max(1, int(iters))):
+        q = q / q.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        q = q / q.sum(dim=-2, keepdim=True).clamp_min(1e-12)
+        q = q * (n_rows / n_cols)
+    q = q / q.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return q
+
+
+class PrototypeHead(nn.Module):
+    """Cabeza de prototipos SwAV compartida (frame-level).
+
+    logits = norm(h) @ norm(C).T / tau; pi = softmax(logits); z = pi @ C.
+    """
+
+    def __init__(self, num_prototypes: int = 64, dim: int = 192, tau: float = 0.1):
+        super().__init__()
+        self.num_prototypes = int(num_prototypes)
+        self.dim = int(dim)
+        self.tau = float(tau)
+        self.prototypes = nn.Parameter(torch.randn(self.num_prototypes, self.dim) * 0.02)
+
+    def forward(self, h: torch.Tensor):
+        dtype = h.dtype
+        c = F.normalize(self.prototypes.float(), dim=1)
+        h_n = F.normalize(h.float(), dim=-1)
+        logits = (h_n @ c.t()) / self.tau
+        pi = logits.softmax(dim=-1)
+        z = pi @ c
+        return logits.to(dtype), pi.to(dtype), z.to(dtype)

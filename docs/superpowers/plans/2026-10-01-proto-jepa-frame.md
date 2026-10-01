@@ -59,6 +59,7 @@ def test_sinkhorn_rows_sum_to_one():
     assert q.shape == (8, 64)
     assert torch.isfinite(q).all()
     assert torch.allclose(q.sum(-1), torch.ones(8), atol=1e-3)
+```
 
 (Convención fijada: `sinkhorn` devuelve matriz row-stochastic, cada fila suma 1.)
 

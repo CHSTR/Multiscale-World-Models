@@ -1,0 +1,79 @@
+# DINOv3 vit_small/16 (embed dim 384) + LoRA, for JEPA.
+#
+# STARLET FRONTEND (igual que el modelo original)
+# ----------------------------------------------
+# `starlet_levels` es un int y manda: el wrapper aplica starlet_conv4d a los
+# frames RGB y deriva in_chans = 3*(levels+1) solo (levels=3 => 12 canales).
+# Filtro b3 y pesos por nivel aprendibles, como wavelet.starlet_encoder.
+#
+# Pesos: ckpt_path=null usa $DINOV3_CKPT si existe, si no descarga por hub.
+# La resolución del backbone es fija a 224.
+_target_: jepa.JEPA
+
+encoder:
+  _target_: src.encoders.dinov3_encoder.DinoV3Encoder
+  pretrained: true
+  # null = portable: usa $DINOV3_CKPT si existe, si no descarga por hub oficial.
+  ckpt_path: null
+  img_size: ${img_size}
+  starlet_levels: 3        # 3 niveles => in_chans = 3*4 = 12 (derivado solo)
+  starlet_filter: b3
+  starlet_learnable_weights: true
+  # --- front-end multiescala (src/encoders/multiscale.py; defaults = comportamiento previo) ---
+  frontend: auto            # auto | none | starlet | swt | rgb_repeat | random
+  frontend_levels: null        # J (null = starlet_levels)
+  swt_filter: bior2.2
+  swt_merge_orientations: false   # true = suma LH+HL+HH por nivel (ablación de orientación)
+  random_kernel: 9
+  random_seed: 0
+  fusion: replace             # replace | residual (rama multiescala inicializada en cero)
+  patch_init: legacy            # legacy (original) | equivalent (W_rgb replicado: exacto en el paso 0)
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_targets: ["qkv", "proj"]
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+# Projector 384 (encoder) -> ${embed_dim} (workspace).
+projector:
+  _target_: module.MLP
+  input_dim: 384
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# Predictor head ${embed_dim} -> ${embed_dim}.
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# Prototype head SwAV compartido (Etapa 1 frame-level, K=64).
+proto_head:
+  _target_: module.PrototypeHead
+  num_prototypes: 64
+  dim: ${embed_dim}
+  tau: 0.1

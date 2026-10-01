@@ -41,6 +41,12 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+  proto:
+    tau: 0.1
+    eps: 0.05
+    iters: 3
+    weight_ce: 1.0
+    weight_mse: 1.0
 
 wandb:
   config:

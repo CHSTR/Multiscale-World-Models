@@ -78,3 +78,14 @@ def test_proto_loss_terms_finite():
     assert out["loss"] == out["mse"] + out["ce"]  # pesos 1.0 en el helper
     assert torch.isfinite(out["perplexity"]) and out["perplexity"] > 1.0
     assert torch.isfinite(out["entropy"]) and out["entropy"] > 0.0
+
+
+def test_proto_yaml_instantiates():
+    import hydra.utils
+
+    head = hydra.utils.instantiate(
+        {"_target_": "module.PrototypeHead", "num_prototypes": 64, "dim": 192, "tau": 0.1}
+    )
+    h = torch.randn(2, 3, 192)
+    logits, pi, z = head(h)
+    assert z.shape == (2, 3, 192)

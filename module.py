@@ -35,6 +35,27 @@ class SIGReg(torch.nn.Module):
         statistic = (err @ self.weights) * proj.size(-2)
         return statistic.mean() # average over projections and time
     
+def sigreg_input(emb, max_tokens=None):
+    """Prepara el input de SIGReg, ``(T, n_samples, D)``.
+
+    * ``emb`` ``(B, T, D)`` (JEPA global): igual que antes, ``emb.transpose(0, 1)``.
+    * ``emb`` ``(B, T, N, D)`` (JEPA espacial): cada patch token es una muestra.
+      Se submuestrean ``max_tokens`` tokens del pool ``B*N`` (mismos índices para
+      todo t) porque el costo de SIGReg escala con ``n_samples * num_proj``.
+      Ojo: el estadístico Epps-Pulley escala con ``n_samples``; con
+      ``max_tokens = batch_size`` el peso ``lambda`` tiene la misma escala que en
+      el baseline.
+    """
+    if emb.ndim == 3:
+        return emb.transpose(0, 1)
+    B, T, N, D = emb.shape
+    x = emb.permute(1, 0, 2, 3).reshape(T, B * N, D)
+    if max_tokens and B * N > max_tokens:
+        idx = torch.randperm(B * N, device=emb.device)[:max_tokens]
+        x = x[:, idx]
+    return x
+
+
 class FeedForward(nn.Module):
     """FeedForward network used in Transformers"""
 

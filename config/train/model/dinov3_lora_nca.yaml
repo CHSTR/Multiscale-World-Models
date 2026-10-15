@@ -1,0 +1,67 @@
+# DINOv3 vit_small/16 + LoRA como encoder, NCA latente como predictor.
+#
+# A diferencia de dinov3_lora (vector CLS por frame), aquí cada frame es la
+# grilla de patch tokens: 224/16 = 14x14 = 196 celdas de ${embed_dim} canales.
+# El NCA itera una regla local compartida sobre esa grilla (ver nca.py).
+#
+# Run:  python train.py data=pusht model=dinov3_lora_nca
+# Ablaciones típicas:
+#   model.predictor.steps=[8,12]          # más pasos => más campo receptivo
+#   model.predictor.damage_prob=0.25      # daño latente (regeneración)
+#   model.predictor.learnable_perception=false
+#   model.predictor.grad_checkpoint=true  # si no cabe en memoria
+_target_: jepa_spatial.SpatialJEPA
+
+patch_size: 16
+
+encoder:
+  _target_: src.encoders.dinov3_encoder.DinoV3Encoder
+  pretrained: true
+  ckpt_path: null
+  img_size: ${img_size}
+  in_chans: 3
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_targets: ["qkv", "proj"]
+
+predictor:
+  _target_: nca.LatentNCAPredictor
+  latent_dim: ${embed_dim}
+  act_dim: ${embed_dim}
+  hidden_channels: 32       # canales ocultos ("química") por celda
+  update_dim: 256           # ancho del MLP de update por celda
+  steps: [4, 8]             # K ~ U[k_min, k_max] en train
+  eval_steps: null          # null => k_max
+  fire_rate: 0.5
+  step_size: 1.0
+  learnable_perception: true
+  padding_mode: replicate
+  use_velocity: true        # ocultos inicializados con [x_t, x_t - x_{t-1}]
+  damage_prob: 0.0
+  damage_radius: [0.15, 0.4]
+  grad_checkpoint: false
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+# Projector token a token: 384 (DINOv3) -> ${embed_dim}.
+projector:
+  _target_: module.MLP
+  input_dim: 384
+  output_dim: ${embed_dim}
+  hidden_dim: 1024
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 1024
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

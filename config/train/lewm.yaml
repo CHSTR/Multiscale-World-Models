@@ -38,6 +38,9 @@ num_preds: 1
 loss:
   sigreg:
     weight: 0.09
+    # Sólo aplica a modelos espaciales (emb (B,T,N,D), p.ej. model=dinov3_lora_nca):
+    # nº de patch tokens submuestreados por paso. = batch_size mantiene la escala de lambda.
+    max_tokens: ${loader.batch_size}
     kwargs:
       knots: 17
       num_proj: 1024

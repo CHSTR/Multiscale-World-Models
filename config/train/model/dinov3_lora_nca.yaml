@@ -41,6 +41,10 @@ predictor:
   damage_prob: 0.0
   damage_radius: [0.15, 0.4]
   grad_checkpoint: false
+  gate: false               # gate por celda sobre ds (ver dinov3_lora_nca_gate_idm)
+  gate_bias_init: 2.0       # sigmoid(2) = 0.88: arranca abierto
+
+inverse_dynamics: null
 
 action_encoder:
   _target_: module.Embedder

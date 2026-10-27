@@ -35,7 +35,7 @@ class DummyEncoder(nn.Module):
         return types.SimpleNamespace(last_hidden_state=torch.cat([pre, p], 1))
 
 
-def build(**nca_kw):
+def build(idm=None, **nca_kw):
     norm = lambda d: nn.BatchNorm1d(d)  # noqa: E731
     return SpatialJEPA(
         encoder=DummyEncoder(),
@@ -44,6 +44,7 @@ def build(**nca_kw):
         projector=MLP(ENC_DIM, 128, D, norm_fn=norm),
         pred_proj=MLP(D, 128, D, norm_fn=norm),
         patch_size=PATCH,
+        inverse_dynamics=idm,
     )
 
 
@@ -143,5 +144,134 @@ for H in (1, 3):
     check(f"get_cost (B,S) con historia {H}", cost.shape == (Bp, S))
     check(f"rollout (B,S,T+1,N,D) con historia {H}",
           info["predicted_emb"].shape == (Bp, S, Tp + 1, N, D))
+
+# 9) Gate por celda
+print("[gate]")
+gnca = LatentNCAPredictor(latent_dim=D, act_dim=D, steps=(3, 3), gate=True).eval()
+y = gnca(x, c)
+check("gate: init cero => identidad", torch.allclose(y, x))
+check("gate: aux gate_map (B,T,N)", gnca.aux["gate_map"].shape == (2, 3, N))
+check("gate: arranca abierto (sigmoid(2))",
+      abs(gnca.aux["gate_mean"].item() - torch.sigmoid(torch.tensor(2.0)).item()) < 1e-5)
+with torch.no_grad():
+    gnca.fc2.weight.normal_(0, 0.05)
+    check("gate abierto => cambia la salida", not torch.allclose(gnca(x, c), x))
+    gnca.gate_head.bias.fill_(-30.0)
+    check("gate cerrado => identidad aunque fc2 != 0", torch.allclose(gnca(x, c), x, atol=1e-6))
+    gnca.gate_head.bias.fill_(2.0)
+    gnca.gate_head.weight.normal_(0, 0.5)
+    gnca(x, c)
+    check("gate depende del estado local (no uniforme)", gnca.aux["gate_map"].std() > 1e-3)
+check("sin gate => aux vacío", (nca(x, c) is not None) and nca.aux == {})
+
+for gc in (False, True):
+    m = LatentNCAPredictor(latent_dim=D, act_dim=D, steps=(3, 3), gate=True, grad_checkpoint=gc).train()
+    m.load_state_dict(gnca.state_dict())
+    xx = x.clone().requires_grad_(True)
+    torch.manual_seed(3)
+    (m(xx, c).pow(2).sum() + m.aux["gate_mean"]).backward()
+    if not gc:
+        ref = xx.grad.clone()
+check("gate + checkpoint == sin checkpoint", torch.allclose(xx.grad, ref, atol=1e-5))
+
+# 10) Dinámica inversa + spatial_losses (como en lejepa_forward)
+print("[idm + spatial_losses]")
+from types import SimpleNamespace  # noqa: E402
+
+from omegaconf import OmegaConf  # noqa: E402
+
+from jepa_spatial import InverseDynamicsHead, spatial_losses  # noqa: E402
+
+idm = InverseDynamicsHead(latent_dim=D, action_dim=A_RAW, hidden_dim=32)
+h0, h1 = torch.randn(2, 3, N, D), torch.randn(2, 3, N, D)
+for pool, gmap in [("attn", None), ("mean", None), ("gate", torch.rand(2, 3, N))]:
+    idm.pool = pool
+    check(f"idm pool={pool} -> (B,T,A)", idm(h0, h1, gmap).shape == (2, 3, A_RAW))
+idm.pool = "gate"
+onehot = torch.zeros(2, 3, N)
+onehot[..., 5] = 1.0
+tok = idm.token_mlp(torch.cat([h0, h1 - h0], -1))[..., 5, :]
+check("pool=gate con gate one-hot lee ese token", torch.allclose(idm(h0, h1, onehot), idm.head(tok), atol=1e-5))
+idm.pool = "auto"
+
+cfg = OmegaConf.create({"loss": {"gate_l1": {"weight": 0.01}, "idm": {"weight": 1.0}},
+                        "diag": {"moving_frac": 0.1}})
+dummy = SimpleNamespace(predictor=SimpleNamespace(aux={}))
+e = torch.randn(2, 4, N, D)
+_, logs = spatial_losses(dummy, {}, e, e[:, :3], e[:, 1:], cfg)
+check("pred = copiar => moving_ratio == 1", abs(logs["moving_ratio"].item() - 1.0) < 1e-5)
+check("copy_loss sin gate ni idm => sin pérdidas extra", "idm_loss" not in logs and "gate_mean" not in logs)
+
+full = build(idm=InverseDynamicsHead(latent_dim=D, action_dim=A_RAW, hidden_dim=32),
+             steps=(2, 3), gate=True).train()
+opt = torch.optim.SGD(full.parameters(), lr=0.05)
+for it in range(3):
+    opt.zero_grad()
+    b = {"pixels": torch.randn(B, T, 3, IMG, IMG), "action": torch.randn(B, T, A_RAW)}
+    out = full.encode(b)
+    emb = out["emb"]
+    pred = full.predict(emb[:, :HS], out["act_emb"][:, :HS])
+    extra, logs = spatial_losses(full, b, emb, pred, emb[:, 1:], cfg)
+    loss = (pred - emb[:, 1:]).pow(2).mean() + 0.09 * sigreg(sigreg_input(emb, B)) + extra
+    loss.backward()
+    if it < 2:
+        opt.step()
+want = {"copy_loss", "pred_loss_moving", "copy_loss_moving", "moving_ratio", "gate_mean",
+        "gate_moving_ratio", "gate_l1_loss", "idm_loss"}
+check("logs completos", want <= set(logs))
+check("logs finitos", all(torch.isfinite(v).all() for v in logs.values()))
+check("logs sin grafo", all(not v.requires_grad for v in logs.values()))
+for name, params in [("encoder (vía idm)", full.encoder.parameters()),
+                     ("inverse_dynamics", full.inverse_dynamics.parameters()),
+                     ("gate_head", full.predictor.gate_head.parameters())]:
+    check(f"grad llega a {name}", any(p.grad is not None and p.grad.abs().sum() > 0 for p in params))
+
+# idm aislada: el gradiente de idm_loss llega al gate (pool=gate)
+opt.zero_grad()
+out = full.encode(b)
+full.predict(out["emb"][:, :HS], out["act_emb"][:, :HS])
+gm = full.predictor.aux["gate_map"]
+F_idm = full.inverse_dynamics(out["emb"][:, :HS], out["emb"][:, 1:HS + 1], gm)
+torch.nn.functional.mse_loss(F_idm, b["action"][:, :HS]).backward()
+check("idm_loss empuja al gate", full.predictor.gate_head.weight.grad.abs().sum() > 0)
+
+# planning sigue funcionando con gate + idm
+full.eval()
+info = {"pixels": torch.randn(2, 3, 3, 3, IMG, IMG), "goal": torch.randn(2, 3, 3, 3, IMG, IMG),
+        "action": torch.randn(2, 3, 3, A_RAW)}
+with torch.no_grad():
+    check("get_cost con gate + idm", full.get_cost(info, torch.randn(2, 3, 6, A_RAW)).shape == (2, 3))
+
+# 11) Probe lineal (sin swm)
+print("[probe]")
+import numpy as np  # noqa: E402
+
+from viz.probe_latent import _ridge_fit_predict, episode_split, expand_angles, ridge_probe  # noqa: E402
+
+g = torch.Generator().manual_seed(0)
+Xa, Ya = torch.randn(30, 50, generator=g).double(), torch.randn(30, 2, generator=g).double()
+Xe = torch.randn(7, 50, generator=g).double()
+primal = Xe @ torch.linalg.solve(Xa.T @ Xa + 3.0 * torch.eye(50, dtype=torch.double), Xa.T @ Ya)
+check("ridge dual == primal", torch.allclose(_ridge_fit_predict(Xa, Ya, Xe, 3.0), primal, atol=1e-8))
+
+split = torch.as_tensor(np.repeat([0, 1, 2], [420, 90, 90]))
+for d in (40, 1500):  # forma primal y dual
+    # features con baja dimensión intrínseca (como tokens reales): X = Z A + ruido
+    Z = torch.randn(600, 5, generator=g)
+    X = Z @ torch.randn(5, d, generator=g) + 0.1 * torch.randn(600, d, generator=g)
+    Yl = Z[:, :3] @ torch.randn(3, 2, generator=g) + 0.05 * torch.randn(600, 2, generator=g)
+    check(f"probe d={d}: señal lineal => R² alto", ridge_probe(X, Yl, split)["r2_test_mean"] > 0.9)
+    Yn = torch.randn(600, 2, generator=g)
+    check(f"probe d={d}: ruido => R² ~ 0", ridge_probe(X, Yn, split)["r2_test_mean"] < 0.1)
+
+off = np.array([0, 50, 120, 160, 300, 330, 400, 470, 520, 600])
+ln = np.diff(np.append(off, 650))
+rows, sp = episode_split(off, ln, 200, seed=0)
+ep_of = np.searchsorted(off, rows, side="right") - 1
+check("split por episodio sin fugas",
+      all(len(set(ep_of[sp == a]) & set(ep_of[sp == b])) == 0 for a, b in [(0, 1), (0, 2), (1, 2)]))
+check("split sin filas repetidas", len(np.unique(rows)) == len(rows))
+Ya, nm = expand_angles(torch.tensor([[1.0, 2.0, 0.5]]), {2})
+check("expand_angles -> sin/cos", nm == ["0", "1", "2_sin", "2_cos"] and Ya.shape == (1, 4))
 
 print("smoke_nca: todo OK")

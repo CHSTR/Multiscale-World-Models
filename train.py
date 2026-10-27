@@ -11,6 +11,7 @@ import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
+from jepa_spatial import spatial_losses
 from module import SIGReg, sigreg_input
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback, StarletVisCallback
 
@@ -41,9 +42,16 @@ def lejepa_forward(self, batch, stage, cfg):
     output["sigreg_loss"] = self.sigreg(
         sigreg_input(emb, cfg.loss.sigreg.get("max_tokens", None))
     )
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+
+    # JEPA espacial (emb (B,T,N,D)): gate L1, dinámica inversa y diagnóstico.
+    extra_logs = {}
+    if emb.ndim == 4:
+        extra, extra_logs = spatial_losses(self.model, batch, emb, pred_emb, tgt_emb, cfg)
+        output["loss"] = output["loss"] + extra
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    losses_dict.update({f"{stage}/{k}": v for k, v in extra_logs.items()})
     if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'level_weights'):
         for i, w in enumerate(self.model.encoder.level_weights):
             losses_dict[f"{stage}/level_weight_{i}"] = w.detach()

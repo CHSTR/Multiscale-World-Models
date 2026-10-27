@@ -48,6 +48,16 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+  # Sólo modelos espaciales con predictor.gate=true: prior de dinámica dispersa.
+  gate_l1:
+    weight: 0.0
+  # Sólo si el modelo tiene inverse_dynamics (p.ej. model=dinov3_lora_nca_gate_idm).
+  idm:
+    weight: 1.0
+
+# Diagnóstico de modelos espaciales: fracción de tokens que cuentan como "móviles".
+diag:
+  moving_frac: 0.1
 
 wandb:
   config:

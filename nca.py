@@ -34,6 +34,10 @@ Diferencias con el NCA de píxeles:
 * Daño latente opcional (``damage_prob``): borra un círculo de celdas del
   latente de entrada y se pide predecir igual el latente completo. Es el
   análogo latente del entrenamiento de regeneración.
+* Gate por celda opcional (``gate=True``): ``ds <- ds * sigmoid(w·h + b)``,
+  generalización aprendida de la máscara de vida. Las celdas sin dinámica
+  (paredes, fondo) pueden apagar su update. Con ``loss.gate_l1.weight > 0``
+  se impone un prior de dinámica dispersa.
 """
 
 import math
@@ -104,6 +108,8 @@ class LatentNCAPredictor(nn.Module):
         damage_prob: float = 0.0,
         damage_radius: Sequence[float] = (0.15, 0.4),
         grad_checkpoint: bool = False,
+        gate: bool = False,
+        gate_bias_init: float = 2.0,
         **_unused,
     ):
         super().__init__()
@@ -148,6 +154,20 @@ class LatentNCAPredictor(nn.Module):
         nn.init.zeros_(self.adaLN[-1].weight)
         nn.init.zeros_(self.adaLN[-1].bias)
 
+        # Gate por celda: g = sigmoid(w·h + b) multiplica ds. Es función del
+        # estado local en cada paso (no un mapa fijo por posición). Arranca
+        # uniforme y abierto: sigmoid(gate_bias_init) = 0.88 con el default.
+        self.use_gate = gate
+        if gate:
+            self.gate_head = nn.Linear(update_dim, 1)
+            nn.init.zeros_(self.gate_head.weight)
+            nn.init.constant_(self.gate_head.bias, gate_bias_init)
+
+        # Salidas auxiliares del último forward (las lee ``jepa_spatial``):
+        #   gate_mean: escalar diferenciable, media de g sobre celdas y pasos.
+        #   gate_map:  (B, T, N), media de g sobre los pasos.
+        self.aux = {}
+
     # ------------------------------------------------------------------ #
     # Regla local
     # ------------------------------------------------------------------ #
@@ -159,18 +179,27 @@ class LatentNCAPredictor(nn.Module):
             s = F.pad(s, (1, 1, 1, 1), mode=self.padding_mode)
         return self.perception(s)
 
-    def nca_step(self, s: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        """Un paso del NCA. ``s``: ``(B, S, gh, gw)``; ``shift/scale``: ``(B, 1, 1, U)``."""
+    def nca_step(self, s: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
+        """Un paso del NCA. ``s``: ``(B, S, gh, gw)``; ``shift/scale``: ``(B, 1, 1, U)``.
+
+        Devuelve ``(s_nuevo, g)`` con ``g`` de shape ``(B, 1, gh, gw)`` (o ``None``
+        sin gate).
+        """
         p = self.perceive(s).permute(0, 2, 3, 1)  # (B, gh, gw, 3S)
         h = self.norm(self.fc1(p))
         h = F.relu(h * (1 + scale) + shift)
         ds = self.fc2(h).permute(0, 3, 1, 2) * self.step_size  # (B, S, gh, gw)
 
+        g = None
+        if self.use_gate:
+            g = torch.sigmoid(self.gate_head(h)).permute(0, 3, 1, 2)  # (B, 1, gh, gw)
+            ds = ds * g
+
         if self.training:
             mask = (torch.rand_like(s[:, :1]) <= self.fire_rate).to(ds.dtype)
-            return s + ds * mask
+            return s + ds * mask, g
         # Eval: update esperado (determinista).
-        return s + ds * self.fire_rate
+        return s + ds * self.fire_rate, g
 
     def num_steps(self) -> int:
         if not self.training:
@@ -236,11 +265,20 @@ class LatentNCAPredictor(nn.Module):
         shift, scale = self.adaLN(c_f).chunk(2, dim=-1)
         shift, scale = shift[:, None, None], scale[:, None, None]
 
+        gates = []
         for _ in range(self.num_steps()):
             if self.grad_checkpoint and self.training and s.requires_grad:
-                s = checkpoint(self.nca_step, s, shift, scale, use_reentrant=False)
+                s, g = checkpoint(self.nca_step, s, shift, scale, use_reentrant=False)
             else:
-                s = self.nca_step(s, shift, scale)
+                s, g = self.nca_step(s, shift, scale)
+            if g is not None:
+                gates.append(g)
+
+        self.aux = {}
+        if gates:
+            gmap = torch.stack(gates, 0).mean(0)  # (BT, 1, gh, gw)
+            self.aux["gate_mean"] = gmap.mean()
+            self.aux["gate_map"] = gmap.reshape(B, Tq, N)
 
         out = s[:, :D].reshape(B * Tq, D, N).transpose(1, 2)  # (BT, N, D)
         return out.reshape(B, Tq, N, D)

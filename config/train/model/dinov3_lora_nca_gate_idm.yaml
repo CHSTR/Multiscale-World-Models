@@ -1,0 +1,22 @@
+# dinov3_lora_nca + gate por celda + dinámica inversa.
+#
+# Run:  python train.py data=pusht model=dinov3_lora_nca_gate_idm loss.gate_l1.weight=0.01
+#
+# Ablaciones (una a la vez, el resto igual):
+#   model.predictor.gate=false model.inverse_dynamics.pool=attn   # sólo IDM
+#   model.inverse_dynamics=null                                   # sólo gate
+#   loss.gate_l1.weight=0.0                                       # gate sin prior disperso
+#   model.inverse_dynamics.pool=attn                              # IDM sin empujar al gate
+defaults:
+  - dinov3_lora_nca
+  - _self_
+
+predictor:
+  gate: true
+
+inverse_dynamics:
+  _target_: jepa_spatial.InverseDynamicsHead
+  latent_dim: ${embed_dim}
+  action_dim: ${..action_encoder.input_dim}   # frameskip * action_dim, lo fija train.py
+  hidden_dim: 256
+  pool: auto                                  # gate si predictor.gate, si no attn

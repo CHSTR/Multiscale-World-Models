@@ -7,6 +7,10 @@ defaults:
 output_model_name: lewm
 subdir: ${hydra:job.id}
 
+# Reanudar: ruta absoluta a un last.ckpt (full-restore: optimizer/epoch/RNG).
+# Ej: python train.py ... resume_from=/ruta/checkpoints/last.ckpt
+resume_from: null
+
 num_workers: 6
 train_split: 0.9
 seed: 3072

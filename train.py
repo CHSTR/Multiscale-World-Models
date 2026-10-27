@@ -159,12 +159,27 @@ def run(cfg):
         enable_checkpointing=True,
     )
 
-    ckpt_path = run_dir / f"{cfg.output_model_name}_weights.ckpt"
+    # Resume: `resume_from=<path a un last.ckpt>` restaura estado completo
+    # (optimizer/scheduler/epoch/RNG) y continúa hasta trainer.max_epochs.
+    # Sin `resume_from` el comportamiento es el original (init desde
+    # weights_epoch_*.ckpt si existe, sólo pesos).
+    resume_from = cfg.get("resume_from", None)
+    if resume_from:
+        ckpt_path = Path(resume_from).expanduser().resolve()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"resume_from apunta a un archivo inexistente: {ckpt_path}")
+        weights_only = False
+    else:
+        ckpt_path = run_dir / f"{cfg.output_model_name}_weights.ckpt"
+        ckpt_path = ckpt_path if ckpt_path.exists() else None
+        weights_only = True
+
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=ckpt_path if ckpt_path.exists() else None,
+        ckpt_path=ckpt_path,
+        weights_only=weights_only,
     )
 
     manager()

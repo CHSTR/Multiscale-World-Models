@@ -1,0 +1,9 @@
+stable-worldmodel>=0.1.1
+gradio>=4
+numpy
+matplotlib
+spaces
+opencv-python-headless
+imageio
+hydra-core
+omegaconf

@@ -1,0 +1,16 @@
+{
+  "index": 2,
+  "start_row": 781968,
+  "dataset": "pusht_expert_train.h5",
+  "context": 3,
+  "a_dim": 2,
+  "n_sub": 5,
+  "act_std": 0.20760807394981384,
+  "act_mean": -0.007812565192580223,
+  "chance": 2.0,
+  "frames": [
+    "preview_0.png",
+    "preview_1.png",
+    "preview_2.png"
+  ]
+}

@@ -1,0 +1,218 @@
+_wandb:
+    value:
+        cli_version: 0.27.2
+        e:
+            2t18ifm0an918wclc07u5ytcli8r9zkd:
+                args:
+                    - data=pusht
+                    - model=dinov3_starlet_lora
+                    - trainer.max_epochs=10
+                    - loader.batch_size=128
+                    - output_model_name=dinov3_s_lora_starletL3_pusht
+                    - subdir=dinov3_s_lora_starletL3_pusht
+                    - wandb.enabled=true
+                    - wandb.config.entity=chstr
+                    - wandb.config.project=lewm
+                codePath: train.py
+                codePathLocal: train.py
+                cpu_count: 6
+                cpu_count_logical: 12
+                cudaVersion: "13.2"
+                disk:
+                    /:
+                        total: "980714024960"
+                        used: "914423508992"
+                email: christopher.stearsr@gmail.com
+                executable: /home/chr/le-wm/.venv/bin/python
+                git:
+                    commit: 16229c360595a3ae3ef01550882ecf5c7ce1c08b
+                    remote: git@github.com:CHSTR/Multiscale-World-Models.git
+                gpu: NVIDIA GeForce RTX 3090
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-20dcefa7-aba2-375e-0ad4-387a18ed6599
+                host: chr-System-Product-Name
+                memory:
+                    total: "65145430016"
+                os: Linux-7.0.0-34-generic-x86_64-with-glibc2.43
+                program: /home/chr/Multiscale-World-Models/train.py
+                python: CPython 3.10.20
+                root: .
+                startedAt: "2026-10-01T11:51:08.913073Z"
+                writerId: 2t18ifm0an918wclc07u5ytcli8r9zkd
+        m:
+            - "1": trainer/global_step
+              "6":
+                - 3
+              "7": []
+            - "2": '*'
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.10.20
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 50
+                - 51
+                - 53
+                - 63
+                - 71
+                - 105
+                - 106
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 50
+                - 51
+                - 53
+                - 63
+                - 71
+                - 105
+                - 106
+            "3":
+                - 7
+                - 13
+                - 14
+                - 66
+            "4": 3.10.20
+            "5": 0.27.2
+            "6": 5.12.1
+            "12": 0.27.2
+            "13": linux-x86_64
+data:
+    value:
+        dataset:
+            frameskip: 5
+            keys_to_cache:
+                - action
+                - proprio
+                - state
+            keys_to_load:
+                - pixels
+                - action
+                - proprio
+                - state
+            name: pusht_expert_train.h5
+            num_steps: ${eval:'${num_preds} + ${history_size}'}
+embed_dim:
+    value: 192
+history_size:
+    value: 3
+img_size:
+    value: 224
+loader:
+    value:
+        batch_size: 128
+        num_workers: ${num_workers}
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 3
+loss:
+    value:
+        sigreg:
+            kwargs:
+                knots: 17
+                num_proj: 1024
+            weight: 0.09
+model:
+    value:
+        _target_: jepa.JEPA
+        action_encoder:
+            _target_: module.Embedder
+            emb_dim: ${embed_dim}
+            input_dim: 10
+        encoder:
+            _target_: src.encoders.dinov3_encoder.DinoV3Encoder
+            ckpt_path: null
+            img_size: ${img_size}
+            lora_alpha: 16
+            lora_dropout: 0.1
+            lora_r: 8
+            lora_targets:
+                - qkv
+                - proj
+            pretrained: true
+            starlet_filter: b3
+            starlet_learnable_weights: true
+            starlet_levels: 3
+        pred_proj:
+            _target_: module.MLP
+            hidden_dim: 2048
+            input_dim: ${embed_dim}
+            norm_fn:
+                _partial_: true
+                _target_: torch.nn.BatchNorm1d
+            output_dim: ${embed_dim}
+        predictor:
+            _target_: module.ARPredictor
+            depth: 6
+            dim_head: 64
+            dropout: 0.1
+            emb_dropout: 0
+            heads: 16
+            hidden_dim: ${embed_dim}
+            input_dim: ${embed_dim}
+            mlp_dim: 2048
+            num_frames: ${history_size}
+            output_dim: ${embed_dim}
+        projector:
+            _target_: module.MLP
+            hidden_dim: 2048
+            input_dim: 384
+            norm_fn:
+                _partial_: true
+                _target_: torch.nn.BatchNorm1d
+            output_dim: ${embed_dim}
+num_preds:
+    value: 1
+num_workers:
+    value: 6
+optimizer:
+    value:
+        lr: 5e-05
+        type: AdamW
+        weight_decay: 0.001
+output_model_name:
+    value: dinov3_s_lora_starletL3_pusht
+seed:
+    value: 3072
+slurm.job_id:
+    value: N/A
+slurm.task_id:
+    value: N/A
+subdir:
+    value: dinov3_s_lora_starletL3_pusht
+system.working_dir:
+    value: /home/chr/Multiscale-World-Models
+train_split:
+    value: 0.9
+trainer:
+    value:
+        accelerator: gpu
+        devices: auto
+        gradient_clip_val: 1
+        max_epochs: 10
+        precision: bf16
+wandb:
+    value:
+        config:
+            entity: chstr
+            id: ${subdir}
+            log_model: false
+            name: ${output_model_name}
+            project: lewm
+            resume: allow
+        enabled: true

@@ -1,0 +1,212 @@
+_wandb:
+    value:
+        cli_version: 0.30.0
+        e:
+            oupnihkgw8kzhugdptulzawxy975xadn:
+                args:
+                    - data=ogb
+                    - model=starlet
+                    - model.encoder.levels=3
+                    - output_model_name=starlet_L3_cube
+                    - wandb.enabled=true
+                    - wandb.config.entity=chstr
+                    - wandb.config.project=lewm
+                    - wandb.config.name=starlet_L3_cube
+                codePath: train.py
+                codePathLocal: train.py
+                cpu_count: 6
+                cpu_count_logical: 12
+                cudaVersion: "13.2"
+                disk:
+                    /:
+                        total: "980714024960"
+                        used: "922920898560"
+                email: christopher.stearsr@gmail.com
+                executable: /home/chr/Multiscale-World-Models/.venv_hf/bin/python
+                git:
+                    commit: 7704459a85e07d27bb292e75d10b571bf110b566
+                    remote: git@github.com:CHSTR/Multiscale-World-Models.git
+                gpu: NVIDIA GeForce RTX 3090
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-20dcefa7-aba2-375e-0ad4-387a18ed6599
+                host: chr-System-Product-Name
+                memory:
+                    total: "65145384960"
+                os: Linux-7.0.0-38-generic-x86_64-with-glibc2.43
+                program: /home/chr/Multiscale-World-Models/train.py
+                python: CPython 3.10.20
+                root: .
+                startedAt: "2026-10-15T02:45:16.030818Z"
+                writerId: oupnihkgw8kzhugdptulzawxy975xadn
+        m:
+            - "1": trainer/global_step
+              "6":
+                - 3
+              "7": []
+            - "2": '*'
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.10.20
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 50
+                - 51
+                - 53
+                - 63
+                - 79
+                - 105
+                - 106
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 50
+                - 51
+                - 53
+                - 63
+                - 79
+                - 105
+                - 106
+            "3":
+                - 7
+                - 13
+                - 66
+            "4": 3.10.20
+            "5": 0.30.0
+            "6": 5.17.0
+            "12": 0.30.0
+            "13": linux-x86_64
+data:
+    value:
+        dataset:
+            frameskip: 5
+            keys_to_cache:
+                - action
+                - observation
+            keys_to_load:
+                - pixels
+                - action
+                - observation
+            keys_to_merge:
+                proprio: proprio
+            name: ogbench/cube_single_expert.h5
+            num_steps: ${eval:'${num_preds} + ${history_size}'}
+embed_dim:
+    value: 192
+history_size:
+    value: 3
+img_size:
+    value: 224
+loader:
+    value:
+        batch_size: 128
+        num_workers: ${num_workers}
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 3
+loss:
+    value:
+        sigreg:
+            kwargs:
+                knots: 17
+                num_proj: 1024
+            max_tokens: ${loader.batch_size}
+            weight: 0.09
+model:
+    value:
+        _target_: jepa.JEPA
+        action_encoder:
+            _target_: module.Embedder
+            emb_dim: ${embed_dim}
+            input_dim: 25
+        encoder:
+            _target_: wavelet.starlet_encoder.StarletEncoder
+            filter: b3
+            learnable_weights: true
+            levels: 3
+            vit:
+                _target_: stable_pretraining.backbone.utils.vit_hf
+                image_size: ${img_size}
+                patch_size: 14
+                pretrained: false
+                size: tiny
+                use_mask_token: false
+        pred_proj:
+            _target_: module.MLP
+            hidden_dim: 2048
+            input_dim: ${embed_dim}
+            output_dim: ${embed_dim}
+        predictor:
+            _target_: module.ARPredictor
+            depth: 6
+            dim_head: 64
+            dropout: 0.1
+            emb_dropout: 0
+            heads: 16
+            hidden_dim: ${embed_dim}
+            input_dim: ${embed_dim}
+            mlp_dim: 2048
+            num_frames: ${history_size}
+            output_dim: ${embed_dim}
+        projector:
+            _target_: module.MLP
+            hidden_dim: 2048
+            input_dim: ${embed_dim}
+            norm_fn:
+                _partial_: true
+                _target_: torch.nn.BatchNorm1d
+            output_dim: ${embed_dim}
+num_preds:
+    value: 1
+num_workers:
+    value: 6
+optimizer:
+    value:
+        lr: 5e-05
+        type: AdamW
+        weight_decay: 0.001
+output_model_name:
+    value: starlet_L3_cube
+seed:
+    value: 3072
+slurm.job_id:
+    value: N/A
+slurm.task_id:
+    value: N/A
+subdir:
+    value: ${hydra:job.id}
+system.working_dir:
+    value: /home/chr/Multiscale-World-Models
+train_split:
+    value: 0.9
+trainer:
+    value:
+        accelerator: gpu
+        devices: auto
+        gradient_clip_val: 1
+        max_epochs: 10
+        precision: bf16
+wandb:
+    value:
+        config:
+            entity: chstr
+            id: ${subdir}
+            log_model: false
+            name: starlet_L3_cube
+            project: lewm
+            resume: allow
+        enabled: true

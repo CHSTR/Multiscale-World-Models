@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv_hf/
 setup.log
 requirements.lock
 checkpoints/

@@ -1,0 +1,71 @@
+# DINOv3 vit_small/16 CONGELADO + NCA latente sobre la grilla de patch tokens,
+# SIN projector ni pred_proj: el predictor trabaja directo en los 384 canales
+# de DINO (estandarizados por canal con stats fijas). No hay parámetros
+# entrenables antes de emb, así que el colapso es imposible y SIGReg sobra
+# (loss.sigreg.weight = 0 en experiment/nca_frozen.yaml).
+#
+# Grilla: img 224 / patch 16 = 14x14 = 196 celdas; estado por celda
+# S = 384 (latente) + hidden_channels.
+#
+# Úsalo vía:  python train.py +experiment=nca_frozen data=pusht
+_target_: jepa_spatial.SpatialJEPA
+
+patch_size: 16
+
+# Estandarización fija por canal (compute_token_stats.py). null = desactivada.
+token_stats_path: ${oc.select:token_stats,null}
+token_dim: 384
+
+# Planning: una sola trayectoria NCA en vez de encadenar predict().
+# false reproduce el comportamiento anterior.
+stateful_rollout: false
+rollout_persist_hidden: true
+
+encoder:
+  _target_: src.encoders.dinov3_encoder.DinoV3Encoder
+  pretrained: true
+  ckpt_path: null          # $DINOV3_CKPT o descarga por hub
+  img_size: ${img_size}
+  in_chans: 3
+  lora_r: 0
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_targets: ["qkv", "proj"]
+  n_dyn_tokens: 0
+  freeze_mode: "all"
+
+projector: null            # identidad: emb = tokens DINO estandarizados
+pred_proj: null            # identidad: la salida del NCA ya está en ese espacio
+
+predictor:
+  _target_: nca.LatentNCAPredictor
+  latent_dim: 384
+  act_dim: ${embed_dim}
+  hidden_channels: 32
+  update_dim: 256          # ablación sugerida: 512 (S = 416 canales)
+  steps: [4, 8]
+  eval_steps: null         # = k_max
+  fire_rate: 0.5
+  step_size: 1.0
+  learnable_perception: true
+  padding_mode: replicate
+  use_velocity: true
+  damage_prob: 0.0
+  grad_checkpoint: false
+  gate: true
+  gate_bias_init: 2.0
+  gate_scope: latent       # "all" = comportamiento anterior
+  eval_mode: fixed_mask    # "mean_field" = comportamiento anterior
+  eval_mask_seed: 0
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???           # lo rellena train.py (frameskip * action_dim)
+  emb_dim: ${embed_dim}
+
+inverse_dynamics:
+  _target_: jepa_spatial.InverseDynamicsHead
+  latent_dim: 384
+  action_dim: ${model.action_encoder.input_dim}
+  hidden_dim: 256
+  pool: auto               # gate si el NCA tiene gate, si no attn

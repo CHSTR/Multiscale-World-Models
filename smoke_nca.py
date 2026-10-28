@@ -242,6 +242,157 @@ info = {"pixels": torch.randn(2, 3, 3, 3, IMG, IMG), "goal": torch.randn(2, 3, 3
 with torch.no_grad():
     check("get_cost con gate + idm", full.get_cost(info, torch.randn(2, 3, 6, A_RAW)).shape == (2, 3))
 
+# 10a) gate_scope: "latent" apaga sólo el latente, los ocultos siguen
+print("[gate_scope]")
+for scope in ("all", "latent"):
+    m = LatentNCAPredictor(latent_dim=D, act_dim=D, steps=(1, 1), gate=True, gate_scope=scope).eval()
+    with torch.no_grad():
+        m.fc2.weight.normal_(0, 0.05)
+        m.gate_head.bias.fill_(-30.0)  # gate cerrado
+        s0 = torch.randn(2, m.state_dim, GH, GW)
+        sh, sc = m._modulation(c[:, 0])
+        s1, _ = m.nca_step(s0, sh, sc, 0)
+    check(f"gate_scope={scope}: latente congelado", torch.allclose(s1[:, :D], s0[:, :D], atol=1e-6))
+    moved = not torch.allclose(s1[:, D:], s0[:, D:], atol=1e-6)
+    check(f"gate_scope={scope}: ocultos {'se actualizan' if scope == 'latent' else 'congelados'}",
+          moved == (scope == "latent"))
+
+# 10b) eval_mode="fixed_mask": determinista, compartida por el batch, != mean-field
+print("[eval_mode]")
+fm = LatentNCAPredictor(latent_dim=D, act_dim=D, steps=(4, 4), eval_mode="fixed_mask").eval()
+mf = LatentNCAPredictor(latent_dim=D, act_dim=D, steps=(4, 4), eval_mode="mean_field").eval()
+with torch.no_grad():
+    fm.fc2.weight.normal_(0, 0.05)
+    mf.load_state_dict(fm.state_dict())
+    a1, a2 = fm(x, c), fm(x, c)
+    check("fixed_mask determinista", torch.equal(a1, a2))
+    check("fixed_mask != mean_field", not torch.allclose(a1, mf(x, c)))
+    check("fixed_mask: muestra sola == dentro del batch", torch.allclose(fm(x[1:], c[1:]), a1[1:], atol=1e-6))
+    msk = fm._eval_mask(torch.zeros(1, 1, 64, 64), 0)
+    check("fixed_mask: fracción ~ fire_rate", abs(msk.mean().item() - fm.fire_rate) < 0.1)
+    check("fixed_mask: only_last == último de full", torch.allclose(fm(x, c, only_last=True), a1[:, -1:], atol=1e-6))
+
+# 10c) rollout(): sin persistir ocultos == encadenar forward(only_last)
+print("[rollout nca]")
+for mode in ("mean_field", "fixed_mask"):
+    r = LatentNCAPredictor(latent_dim=D, act_dim=D, steps=(3, 3), gate=True, eval_mode=mode).eval()
+    with torch.no_grad():
+        r.fc2.weight.normal_(0, 0.05)
+        r.hidden_init.weight.normal_(0, 0.2)
+        r.adaLN[-1].weight.normal_(0, 0.1)
+        cs = torch.randn(2, 4, D)
+        for hs in (1, 3):
+            emb_c = x[:, -hs:]
+            chain = [emb_c[:, i] for i in range(hs)]
+            for m in range(cs.size(1)):
+                ctx_m = torch.stack(chain[-hs:], 1)
+                cm = cs[:, m:m + 1].expand(-1, ctx_m.size(1), -1)
+                chain.append(r(ctx_m, cm, only_last=True)[:, 0])
+            ref_chain = torch.stack(chain[hs:], 1)
+            got = r.rollout(emb_c, cs, persist_hidden=False)
+            check(f"rollout {mode} hist={hs}: sin persistir == encadenado",
+                  torch.allclose(got, ref_chain, atol=1e-5))
+        per = r.rollout(x, cs, persist_hidden=True)
+        nop = r.rollout(x, cs, persist_hidden=False)
+        check(f"rollout {mode}: primer paso igual con y sin persistir", torch.allclose(per[:, 0], nop[:, 0], atol=1e-6))
+        check(f"rollout {mode}: persistir ocultos cambia los pasos siguientes", not torch.allclose(per[:, 1:], nop[:, 1:]))
+        check(f"rollout {mode}: aux_rollout gate_map (B,M,N)", r.aux_rollout["gate_map"].shape == (2, 4, N))
+        check(f"rollout {mode}: no pisa aux del forward", r.aux.get("gate_map") is None or r.aux["gate_map"].shape[1] != 4)
+
+# 10d) SpatialJEPA.stateful_rollout: sin persistir == bucle de planning original
+print("[stateful planning]")
+sj = build(steps=(3, 3), gate=True).eval()
+with torch.no_grad():
+    sj.predictor.fc2.weight.normal_(0, 0.05)
+    sj.predictor.adaLN[-1].weight.normal_(0, 0.1)
+    for H in (1, 3):
+        info = {"pixels": torch.randn(2, 3, H, 3, IMG, IMG), "goal": torch.randn(2, 3, H, 3, IMG, IMG),
+                "action": torch.randn(2, 3, H, A_RAW)}
+        cand = torch.randn(2, 3, H + 4, A_RAW)
+        sj.stateful_rollout = False
+        c_loop = sj.get_cost(dict(info), cand.clone())
+        sj.stateful_rollout, sj.rollout_persist_hidden = True, False
+        c_state = sj.get_cost(dict(info), cand.clone())
+        check(f"stateful (sin persistir) == bucle original, historia {H}", torch.allclose(c_loop, c_state, rtol=1e-4, atol=1e-3))
+        sj.rollout_persist_hidden = True
+        out_info = dict(info)
+        c_pers = sj.get_cost(out_info, cand.clone())
+        check(f"stateful (persistiendo) -> (B,S) y rollout (B,S,T+1,N,D), historia {H}",
+              c_pers.shape == (2, 3) and out_info["predicted_emb"].shape == (2, 3, H + 5, N, D))
+    sj.stateful_rollout = False
+
+# 10e) Estandarización por canal de los tokens (sin projector)
+print("[token stats]")
+import os, tempfile, warnings  # noqa: E401,E402
+
+tmp = tempfile.mkdtemp()
+stats_path = os.path.join(tmp, "stats.pt")
+mu, sd = torch.randn(ENC_DIM), torch.rand(ENC_DIM) + 0.5
+torch.save({"mean": mu, "std": sd}, stats_path)
+
+
+def build_raw(path, **kw):
+    return SpatialJEPA(
+        encoder=DummyEncoder(),
+        predictor=LatentNCAPredictor(latent_dim=ENC_DIM, act_dim=D, steps=(2, 2), gate=True),
+        action_encoder=Embedder(input_dim=A_RAW, emb_dim=D),
+        projector=None, pred_proj=None, patch_size=PATCH,
+        token_stats_path=path, token_dim=ENC_DIM, **kw,
+    )
+
+
+raw = build_raw(stats_path).eval()
+plain = build_raw(None).eval()
+plain.encoder.load_state_dict(raw.encoder.state_dict())
+px = torch.randn(2, 2, 3, IMG, IMG)
+with torch.no_grad():
+    e_norm = raw.encode({"pixels": px})["emb"]
+    e_raw = plain.encode({"pixels": px})["emb"]
+check("sin projector: emb = tokens del encoder", e_raw.shape == (2, 2, N, ENC_DIM))
+check("stats: emb = (tokens - mean) / std", torch.allclose(e_norm, (e_raw - mu) / sd, atol=1e-5))
+check("stats: buffers en el state_dict", {"token_mean", "token_std"} <= set(raw.state_dict()))
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    reloaded = build_raw(os.path.join(tmp, "no_existe.pt"))
+reloaded.load_state_dict(raw.state_dict())
+check("stats: recarga sin archivo vía state_dict", torch.equal(reloaded.token_mean, mu))
+
+# 10f) idm_pred: el gradiente llega al predictor, no a la cabeza IDM
+print("[idm_pred + rollout loss]")
+cfg_ip = OmegaConf.create({"history_size": HS, "loss": {"idm": {"weight": 0.0}, "idm_pred": {"weight": 1.0}},
+                           "diag": {"moving_frac": 0.1}})
+mi = build(idm=InverseDynamicsHead(latent_dim=D, action_dim=A_RAW, hidden_dim=32), steps=(2, 2), gate=True).train()
+b = {"pixels": torch.randn(B, T, 3, IMG, IMG), "action": torch.randn(B, T, A_RAW)}
+out = mi.encode(b)
+pred = mi.predict(out["emb"][:, :HS], out["act_emb"][:, :HS])
+extra, logs = spatial_losses(mi, b, out["emb"], pred, out["emb"][:, 1:HS + 1], cfg_ip, act_emb=out["act_emb"])
+extra.backward()
+check("idm_pred_loss logueada", "idm_pred_loss" in logs)
+check("idm_pred: grad llega al predictor (fc2)", mi.predictor.fc2.weight.grad.abs().sum() > 0)
+check("idm_pred: cabeza IDM sin gradiente",
+      all(p.grad is None or p.grad.abs().sum() == 0 for p in mi.inverse_dynamics.parameters()))
+
+# 10g) loss.rollout
+for steps_r in (2, 3):
+    cfg_r = OmegaConf.create({"history_size": HS, "loss": {"rollout": {"weight": 1.0, "steps": steps_r}},
+                              "diag": {"moving_frac": 0.1}})
+    mr = build(steps=(2, 2), gate=True).train()
+    mr.zero_grad()
+    out = mr.encode(dict(b))
+    pred = mr.predict(out["emb"][:, :HS], out["act_emb"][:, :HS])
+    extra, logs = spatial_losses(mr, b, out["emb"], pred, out["emb"][:, 1:HS + 1], cfg_r, act_emb=out["act_emb"])
+    extra.backward()
+    check(f"rollout steps={steps_r}: pérdida finita", torch.isfinite(logs["rollout_loss"]).item())
+    check(f"rollout steps={steps_r}: grad llega al predictor", mr.predictor.fc2.weight.grad.abs().sum() > 0)
+    check(f"rollout steps={steps_r}: no pisa el gate_map del forward",
+          mr.predictor.aux["gate_map"].shape == (B, HS, N))
+try:
+    cfg_bad = OmegaConf.create({"history_size": HS, "loss": {"rollout": {"weight": 1.0, "steps": T}}})
+    spatial_losses(mr, b, out["emb"], pred, out["emb"][:, 1:HS + 1], cfg_bad, act_emb=out["act_emb"])
+    check("rollout steps > T-1 falla con mensaje claro", False)
+except AssertionError as e:
+    check("rollout steps > T-1 falla con mensaje claro", "num_steps" in str(e))
+
 # 11) Probe lineal (sin swm)
 print("[probe]")
 import numpy as np  # noqa: E402

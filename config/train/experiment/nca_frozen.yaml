@@ -1,0 +1,49 @@
+# @package _global_
+#
+# DINOv3-S/16 congelado + NCA, sin projector y sin SIGReg.
+#
+#   1) Stats por canal (una vez por entorno):
+#        python compute_token_stats.py +experiment=nca_frozen data=pusht \
+#            +stats.out=token_stats/pusht_dinov3s16.pt
+#   2) Entrenar:
+#        python train.py +experiment=nca_frozen data=pusht \
+#            token_stats=token_stats/pusht_dinov3s16.pt
+#
+# Ablaciones (cada una se activa sola, el resto queda como aquí):
+#   loss.idm_pred.weight=0.5                IDM sobre transiciones predichas
+#   loss.rollout.weight=1.0                 rollout de 2 pasos (TBPTT)
+#   loss.rollout.persist_hidden=false       ... reinicializando los ocultos
+#   model.stateful_rollout=true             planning con una sola trayectoria NCA
+#   model.predictor.gate_scope=all          gate como antes (ocultos incluidos)
+#   model.predictor.eval_mode=mean_field    eval como antes
+#   token_stats=null                        sin estandarización
+#
+# Para loss.rollout.steps > history_size hace falta un batch más largo:
+#   data.dataset.num_steps=<history_size + steps>
+
+defaults:
+  - override /model: dinov3_nca_frozen
+
+output_model_name: dinov3_nca_frozen
+
+# Ruta a las stats de compute_token_stats.py (null = sin estandarización).
+token_stats: null
+
+loss:
+  sigreg:
+    weight: 0.0            # gradiente cero con encoder congelado y sin projector
+  gate_l1:
+    weight: 0.01
+  idm:
+    weight: 1.0            # entrena la cabeza IDM sobre pares reales
+  idm_pred:
+    weight: 0.0            # misma cabeza, congelada, sobre (x_t, ẑ_{t+1})
+  rollout:
+    weight: 0.0
+    steps: 2
+    detach: true           # TBPTT entre pasos del mundo
+    persist_hidden: true   # ocultos del NCA persisten entre pasos
+    last_only: false
+
+diag:
+  moving_frac: 0.1

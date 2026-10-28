@@ -14,12 +14,28 @@ la grilla de patch tokens del encoder, ``(B, T, N, D)`` con ``N = gh * gw``.
 * ``inverse_dynamics`` (opcional): cabeza que predice ``a_t`` desde
   ``(x_t, x_{t+1})`` del encoder. Ancla la representación a lo que la acción
   controla (ver ``spatial_losses``).
+
+Opciones para encoder congelado sin projector (todas desactivadas por defecto):
+
+* ``token_stats_path``: estandarización fija por canal de los patch tokens,
+  ``(x - mean) / std`` con estadísticas precalculadas por
+  ``compute_token_stats.py``. Es lineal e invertible (no descarta
+  información) y quita la anisotropía de los canales de DINO del MSE. Se
+  aplica en ``encode``, así que también normaliza el goal al planificar.
+* ``stateful_rollout``: al planificar, una sola trayectoria NCA
+  (``predictor.rollout``) en vez de encadenar ``predict``. Con
+  ``rollout_persist_hidden=True`` los canales ocultos se conservan entre pasos.
 """
+
+import warnings
+from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
+from torch.func import functional_call
 
 from jepa import JEPA, detach_clone
 
@@ -76,7 +92,52 @@ class InverseDynamicsHead(nn.Module):
         return self.head(pooled)
 
 
-def spatial_losses(model, batch, emb, pred_emb, tgt_emb, cfg):
+def _cfg_get(loss_cfg, name, key, default):
+    return (loss_cfg.get(name, None) or {}).get(key, default)
+
+
+def rollout_loss(model, emb, act_emb, cfg):
+    """Pérdida de rollout multi-paso con el predictor encadenándose a sí mismo.
+
+    Usa los últimos ``M + 1`` frames del batch: arranca en ``t0 = T - 1 - M``
+    (con el frame anterior para la velocidad, si ``history_size > 1``) y
+    predice ``x_{t0+1} … x_{t0+M}`` con las acciones ``a_{t0} … a_{t0+M-1}``.
+    Con el batch por defecto (T = history_size + 1) y ``M = 2``, el primer paso
+    parte de un latente real y el segundo de la propia predicción.
+
+    ``loss.rollout``:
+      * ``weight`` (0 = desactivado), ``steps`` (M)
+      * ``detach``: TBPTT, corta el gradiente entre pasos del mundo
+      * ``persist_hidden``: conserva los canales ocultos del NCA entre pasos
+      * ``last_only``: sólo el último paso entra en la pérdida (estilo Terver)
+
+    Devuelve ``(loss, logs)``.
+    """
+    r = cfg.loss.get("rollout", None) or {}
+    M = int(r.get("steps", 2))
+    T = emb.size(1)
+    assert act_emb is not None, "loss.rollout necesita act_emb"
+    assert 1 <= M <= T - 1, (
+        f"loss.rollout.steps={M} necesita T >= M + 1 frames y el batch tiene T={T}; "
+        "sube data.dataset.num_steps"
+    )
+    t0 = T - 1 - M
+    n_ctx = 2 if cfg.history_size > 1 else 1
+    x_ctx = emb[:, max(0, t0 - n_ctx + 1): t0 + 1]
+    preds = model.predict_rollout(
+        x_ctx, act_emb[:, t0: t0 + M],
+        persist_hidden=bool(r.get("persist_hidden", True)),
+        detach_between=bool(r.get("detach", True)),
+        history=int(cfg.history_size),
+    )  # (B, M, N, D)
+    target = emb[:, t0 + 1: t0 + 1 + M]
+    per_step = (preds - target).float().pow(2).mean(dim=(0, 2, 3))  # (M,)
+    loss = per_step[-1] if r.get("last_only", False) else per_step.mean()
+    logs = {"rollout_loss": loss.detach(), "rollout_loss_last": per_step[-1].detach()}
+    return loss, logs
+
+
+def spatial_losses(model, batch, emb, pred_emb, tgt_emb, cfg, act_emb=None):
     """Pérdidas auxiliares y diagnóstico para JEPA espacial (emb ``(B, T, N, D)``).
 
     Devuelve ``(extra_loss, logs)``: ``extra_loss`` se suma a la loss total y
@@ -84,7 +145,10 @@ def spatial_losses(model, batch, emb, pred_emb, tgt_emb, cfg):
 
     Diagnóstico (sin gradiente):
       * ``copy_loss``: MSE de predecir ``x_{t+1} = x_t``. Es la línea base que
-        el NCA tiene en la inicialización.
+        el NCA tiene en la inicialización. También mide cuánto cambian los
+        objetivos: si cae junto con ``gate_mean`` a lo largo del entrenamiento,
+        la representación se está volviendo estática (sólo posible con
+        projector o encoder entrenables).
       * ``pred_loss_moving`` / ``copy_loss_moving``: las mismas MSE pero sólo
         sobre el ``diag.moving_frac`` de tokens que más cambian.
       * ``moving_ratio`` = pred/copy en tokens móviles. < 1 => el modelo
@@ -94,7 +158,14 @@ def spatial_losses(model, batch, emb, pred_emb, tgt_emb, cfg):
 
     Pérdidas (con gradiente, sólo si su peso > 0 / el módulo existe):
       * ``gate_l1_loss`` (``loss.gate_l1.weight``): media del gate (g >= 0).
-      * ``idm_loss`` (``loss.idm.weight``): MSE de la dinámica inversa.
+      * ``idm_loss`` (``loss.idm.weight``): MSE de la dinámica inversa sobre
+        pares reales ``(x_t, x_{t+1})``. Entrena la cabeza IDM (y, si la
+        representación es entrenable, la ancla a la acción).
+      * ``idm_pred_loss`` (``loss.idm_pred.weight``): la misma cabeza, con sus
+        pesos congelados, aplicada a ``(x_t, ẑ_{t+1})``. Obliga a que la
+        transición predicha sea consistente con la acción que la produjo; el
+        gradiente llega sólo al predictor (y al gate vía el pooling).
+      * ``rollout_loss`` (``loss.rollout.weight``): ver ``rollout_loss``.
     """
     loss_cfg = cfg.loss
     diag_cfg = cfg.get("diag", None) or {}
@@ -124,7 +195,7 @@ def spatial_losses(model, batch, emb, pred_emb, tgt_emb, cfg):
             if moving.any() and (~moving).any():
                 logs["gate_moving_ratio"] = g[moving].mean() / (g[~moving].mean() + 1e-8)
 
-    w_gate = float((loss_cfg.get("gate_l1", None) or {}).get("weight", 0.0))
+    w_gate = float(_cfg_get(loss_cfg, "gate_l1", "weight", 0.0))
     if w_gate > 0 and "gate_mean" in aux:
         gl1 = aux["gate_mean"].float()
         extra = extra + w_gate * gl1
@@ -137,9 +208,26 @@ def spatial_losses(model, batch, emb, pred_emb, tgt_emb, cfg):
         target = batch["action"][:, :HS].float()
         pred_a = idm(x0, x1, gate_map)
         idm_loss = F.mse_loss(pred_a.float(), target)
-        w_idm = float((loss_cfg.get("idm", None) or {}).get("weight", 1.0))
+        w_idm = float(_cfg_get(loss_cfg, "idm", "weight", 1.0))
         extra = extra + w_idm * idm_loss
         logs["idm_loss"] = idm_loss.detach()
+
+        # IDM sobre la transición predicha, con la cabeza congelada: el
+        # gradiente no entrena a la IDM a leer artefactos del predictor.
+        w_idm_pred = float(_cfg_get(loss_cfg, "idm_pred", "weight", 0.0))
+        if w_idm_pred > 0:
+            frozen = {k: v.detach() for k, v in idm.named_parameters()}
+            frozen.update(dict(idm.named_buffers()))
+            pred_a_hat = functional_call(idm, frozen, (x0, pred_emb, gate_map))
+            idm_pred_loss = F.mse_loss(pred_a_hat.float(), target)
+            extra = extra + w_idm_pred * idm_pred_loss
+            logs["idm_pred_loss"] = idm_pred_loss.detach()
+
+    w_roll = float(_cfg_get(loss_cfg, "rollout", "weight", 0.0))
+    if w_roll > 0:
+        r_loss, r_logs = rollout_loss(model, emb, act_emb, cfg)
+        extra = extra + w_roll * r_loss
+        logs.update(r_logs)
 
     return extra, logs
 
@@ -147,11 +235,42 @@ def spatial_losses(model, batch, emb, pred_emb, tgt_emb, cfg):
 class SpatialJEPA(JEPA):
 
     def __init__(self, encoder, predictor, action_encoder, projector=None,
-                 pred_proj=None, patch_size: int = 16, inverse_dynamics=None):
+                 pred_proj=None, patch_size: int = 16, inverse_dynamics=None,
+                 token_stats_path: Optional[str] = None, token_dim: Optional[int] = None,
+                 stateful_rollout: bool = False, rollout_persist_hidden: bool = True):
         super().__init__(encoder, predictor, action_encoder, projector, pred_proj)
         self.patch_size = patch_size
         self.inverse_dynamics = inverse_dynamics
         self.grid_hw = None  # se fija en el primer ``encode``
+        self.stateful_rollout = stateful_rollout
+        self.rollout_persist_hidden = rollout_persist_hidden
+
+        # Estandarización fija por canal. Los buffers viajan en el state_dict,
+        # así que al recargar el checkpoint no hace falta el archivo de stats
+        # (basta con ``token_dim`` para crear buffers del tamaño correcto).
+        self.normalize_tokens = token_stats_path is not None
+        if self.normalize_tokens:
+            mean, std = self._load_token_stats(token_stats_path, token_dim)
+            self.register_buffer("token_mean", mean)
+            self.register_buffer("token_std", std)
+
+    @staticmethod
+    def _load_token_stats(path, dim, eps: float = 1e-6):
+        p = Path(path).expanduser()
+        if p.is_file():
+            stats = torch.load(p, map_location="cpu")
+            mean, std = stats["mean"].float(), stats["std"].float()
+            assert mean.ndim == 1 and mean.shape == std.shape, "stats: mean/std deben ser (D,)"
+            assert dim is None or mean.numel() == dim, (
+                f"token_dim={dim} pero las stats tienen D={mean.numel()}"
+            )
+            return mean, std.clamp_min(eps)
+        assert dim is not None, (
+            f"no existe {p} y falta token_dim para crear los buffers; "
+            "corre compute_token_stats.py o pasa token_dim al recargar"
+        )
+        warnings.warn(f"{p} no existe: buffers identidad (se esperan desde el state_dict)")
+        return torch.zeros(dim), torch.ones(dim)
 
     def _tokenwise(self, mlp, x):
         """Aplica un MLP (con BatchNorm1d) token a token sobre ``(B, T, N, D)``."""
@@ -176,6 +295,8 @@ class SpatialJEPA(JEPA):
         self.grid_hw = (gh, gw)
 
         patches = rearrange(tokens[:, -n:], "(b t) n d -> b t n d", b=b)
+        if self.normalize_tokens:
+            patches = (patches - self.token_mean) / self.token_std
         info["emb"] = self._tokenwise(self.projector, patches)
 
         if "action" in info:
@@ -186,6 +307,25 @@ class SpatialJEPA(JEPA):
         """emb: ``(B, T, N, D)``, act_emb: ``(B, T, A)`` -> ``(B, T', N, D)``."""
         preds = self.predictor(emb, act_emb, grid_hw=self.grid_hw, only_last=only_last)
         return self._tokenwise(self.pred_proj, preds)
+
+    def predict_rollout(self, emb_ctx, act_emb_seq, persist_hidden: bool = True,
+                        detach_between: bool = False, history: Optional[int] = None):
+        """Rollout multi-paso del predictor en una sola trayectoria.
+
+        emb_ctx: ``(B, Tc, N, D)`` (se usan los dos últimos frames);
+        act_emb_seq: ``(B, M, A)`` -> ``(B, M, N, D)``. ``pred_proj`` se aplica
+        a cada salida antes de retroalimentarla, como al encadenar ``predict``.
+        ``history``: el ``history_size`` con que se encadenaría ``predict``.
+        """
+        assert hasattr(self.predictor, "rollout"), "el predictor no implementa rollout()"
+
+        def post(y):  # (B, N, D) -> (B, N, D)
+            return self._tokenwise(self.pred_proj, y.unsqueeze(1)).squeeze(1)
+
+        return self.predictor.rollout(
+            emb_ctx, act_emb_seq, grid_hw=self.grid_hw, post=post,
+            persist_hidden=persist_hidden, detach_between=detach_between, history=history,
+        )
 
     ####################
     ## Inference only ##
@@ -214,6 +354,19 @@ class SpatialJEPA(JEPA):
         act_future = rearrange(act_future, "b s ... -> (b s) ...")
 
         HS = history_size
+        if self.stateful_rollout:
+            # Una sola trayectoria NCA: misma secuencia de acciones que el bucle
+            # de abajo (a_{H-1} … a_{T-1}), pero los ocultos pueden persistir.
+            # Requiere un action_encoder por paso (Embedder lo es).
+            act_all = torch.cat([act, act_future], dim=1)       # (BS, T, A_raw)
+            act_emb = self.action_encoder(act_all)[:, H - 1:]   # (BS, n_steps + 1, A)
+            preds = self.predict_rollout(
+                emb[:, -HS:], act_emb, persist_hidden=self.rollout_persist_hidden, history=HS,
+            )
+            emb = torch.cat([emb, preds], dim=1)
+            info["predicted_emb"] = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
+            return info
+
         for t in range(n_steps + 1):
             act_emb = self.action_encoder(act)
             pred_emb = self.predict(emb[:, -HS:], act_emb[:, -HS:], only_last=True)

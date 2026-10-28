@@ -34,20 +34,30 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_emb = emb[:, :ctx_len]
     ctx_act = act_emb[:, : ctx_len]
 
-    tgt_emb = emb[:, n_preds:] # label
+    # label. Con el batch por defecto (T = history_size + num_preds) es igual a
+    # emb[:, n_preds:]; el recorte deja usar batches más largos (p. ej. para
+    # loss.rollout con más pasos) sin cambiar el teacher forcing.
+    tgt_emb = emb[:, n_preds: n_preds + ctx_len]
     pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
 
     # LeWM loss
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"] = self.sigreg(
-        sigreg_input(emb, cfg.loss.sigreg.get("max_tokens", None))
-    )
+    if lambd > 0:
+        output["sigreg_loss"] = self.sigreg(
+            sigreg_input(emb, cfg.loss.sigreg.get("max_tokens", None))
+        )
+    else:
+        # Sin parámetros entrenables antes de emb (encoder congelado y sin
+        # projector) SIGReg tiene gradiente cero: no se calcula.
+        output["sigreg_loss"] = pred_emb.new_zeros((), dtype=torch.float32)
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
-    # JEPA espacial (emb (B,T,N,D)): gate L1, dinámica inversa y diagnóstico.
+    # JEPA espacial (emb (B,T,N,D)): gate L1, dinámica inversa, rollout y diagnóstico.
     extra_logs = {}
     if emb.ndim == 4:
-        extra, extra_logs = spatial_losses(self.model, batch, emb, pred_emb, tgt_emb, cfg)
+        extra, extra_logs = spatial_losses(
+            self.model, batch, emb, pred_emb, tgt_emb, cfg, act_emb=act_emb
+        )
         output["loss"] = output["loss"] + extra
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}

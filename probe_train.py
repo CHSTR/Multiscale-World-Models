@@ -94,6 +94,14 @@ def sample_and_split(dataset, n_frames: int, val_frac: float = 0.2, seed: int = 
     return idx[~is_val].tolist(), idx[is_val].tolist()
 
 
+def group_targets(targets_by_col: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Concatena las columnas de cada grupo respetando sus dimensiones reales."""
+    return {
+        group: np.concatenate([targets_by_col[c] for c in cols], axis=1)
+        for group, cols in GROUP_SPECS.items()
+    }
+
+
 def drop_nan_rows(targets: dict[str, np.ndarray]) -> np.ndarray:
     """Mascara True para filas sin NaN en ninguna columna de ningun grupo."""
     n = len(next(iter(targets.values())))
@@ -385,11 +393,12 @@ def make_rows(
     rows = []
     offset = 0
     for group, cols in group_specs.items():
-        dim = len(cols)
         if isinstance(y_true, dict):
             yt, yp = y_true[group], y_pred[group]
             var = None if var_raw is None else var_raw.get(group)
+            dim = int(np.asarray(yt).shape[1])
         else:
+            dim = len(cols)
             yt = np.asarray(y_true)[:, offset : offset + dim]
             yp = np.asarray(y_pred)[:, offset : offset + dim]
             var = None if var_raw is None else np.asarray(var_raw)[offset : offset + dim]
@@ -492,42 +501,33 @@ def run_probe(
         model, dataset, ckpt, out_dir, n_frames, val_frac, seed, sources, force
     )
 
-    # columnas en orden de grupo
-    ordered = [c for cols in GROUP_SPECS.values() for c in cols]
-    Ytr_full = np.concatenate([tgt_tr[c] for c in ordered], axis=1)
-    Yva_full = np.concatenate([tgt_va[c] for c in ordered], axis=1)
-    var_full = Ytr_full.var(axis=0)
+    Ytr = group_targets(tgt_tr)
+    Yva = group_targets(tgt_va)
+    var = {g: Ytr[g].var(axis=0) for g in GROUP_SPECS}
 
     rows: list[dict] = []
     for s in sources:
         Xtr, Xva = feats[s]
         ok_tr = drop_nan_rows(tgt_tr)
         ok_va = drop_nan_rows(tgt_va)
-        Xtr, Ytr = Xtr[ok_tr], Ytr_full[ok_tr]
-        Xva, Yva = Xva[ok_va], Yva_full[ok_va]
+        Xtr = Xtr[ok_tr]
+        Xva = Xva[ok_va]
+        Ytr_s = {g: v[ok_tr] for g, v in Ytr.items()}
+        Yva_s = {g: v[ok_va] for g, v in Yva.items()}
 
-        # Ridge global: una W por grupo para conservar la semantica de grupos
-        offset = 0
-        pred_tr = np.zeros_like(Ytr)
-        pred_va = np.zeros_like(Yva)
-        for group, cols in GROUP_SPECS.items():
-            d = len(cols)
-            W, b, alpha = fit_ridge(Xtr, Ytr[:, offset : offset + d], Xva, Yva[:, offset : offset + d])
-            Ztr, Zva, _ = standardize(Xtr, Xva)
-            pred_va[:, offset : offset + d] = Zva @ W + b
-            pred_tr[:, offset : offset + d] = Ztr @ W + b
-            offset += d
-        rows += make_rows(ckpt, s, "ridge", Yva, pred_va, GROUP_SPECS, var_full)
+        Ztr, Zva, _ = standardize(Xtr, Xva)
 
-        # MLP por grupo
-        offset = 0
-        pred_va = np.zeros_like(Yva)
-        for group, cols in GROUP_SPECS.items():
-            d = len(cols)
-            m = fit_mlp(Xtr, Ytr[:, offset : offset + d], Xva, Yva[:, offset : offset + d], seed=seed)
-            pred_va[:, offset : offset + d] = predict_mlp(m, Xva)
-            offset += d
-        rows += make_rows(ckpt, s, "mlp", Yva, pred_va, GROUP_SPECS, var_full)
+        pred_va: dict[str, np.ndarray] = {}
+        for group in GROUP_SPECS:
+            W, b, _ = fit_ridge(Xtr, Ytr_s[group], Xva, Yva_s[group])
+            pred_va[group] = Zva @ W + b
+        rows += make_rows(ckpt, s, "ridge", Yva_s, pred_va, GROUP_SPECS, var)
+
+        pred_va = {}
+        for group in GROUP_SPECS:
+            m = fit_mlp(Xtr, Ytr_s[group], Xva, Yva_s[group], seed=seed)
+            pred_va[group] = predict_mlp(m, Xva)
+        rows += make_rows(ckpt, s, "mlp", Yva_s, pred_va, GROUP_SPECS, var)
 
         print(f"[probe] {s}: ridge+mlp listos ({len(rows)} filas acumuladas)")
 

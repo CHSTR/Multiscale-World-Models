@@ -62,17 +62,10 @@ def write_markdown(df: pd.DataFrame, path: str | Path) -> None:
     Path(path).write_text(out.to_markdown(index=False) + "\n")
 
 
-def write_heatmap(df: pd.DataFrame, path: str | Path) -> None:
-    pivot = df.pivot_table(index="group", columns="setting", values="pearson")
-    order = [
-        "joint_pos", "joint_vel", "effector_pos", "effector_yaw",
-        "gripper", "block_pos", "block_quat", "block_yaw",
-    ]
-    pivot = pivot.reindex([g for g in order if g in pivot.index])
-
+def _draw_heatmap(pivot, path, usetex: bool) -> None:
     plt.rcParams.update(
         {
-            "text.usetex": True,
+            "text.usetex": usetex,
             "font.family": "serif",
             "font.serif": ["Computer Modern Roman"],
             "font.size": 9,
@@ -81,25 +74,43 @@ def write_heatmap(df: pd.DataFrame, path: str | Path) -> None:
     fig, ax = plt.subplots(figsize=(1.05 * len(pivot.columns) + 3.2, 0.55 * len(pivot) + 2.2))
     im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn", vmin=0, vmax=1)
     ax.set_xticks(range(len(pivot.columns)))
-    ax.set_xticklabels(
-        [c.replace(" | ", "\n") for c in pivot.columns], fontsize=7.5, rotation=0
-    )
+    ax.set_xticklabels([c.replace(" | ", "\n") for c in pivot.columns], fontsize=7.5, rotation=0)
     ax.set_yticks(range(len(pivot.index)))
-    ax.set_yticklabels(
-        [r"\texttt{" + g.replace("_", r"\_") + "}" for g in pivot.index], fontsize=9
-    )
-    ax.set_title(r"\textbf{Pearson $r$ of physical quantities from frozen latents (Cube)}", fontsize=11)
+    if usetex:
+        labels = [r"\texttt{" + g.replace("_", r"\_") + "}" for g in pivot.index]
+        title = r"\textbf{Pearson $r$ of physical quantities from frozen latents (Cube)}"
+        cblabel = r"Pearson $r$"
+    else:
+        labels = [g.replace("_", " ") for g in pivot.index]
+        title = "Pearson r of physical quantities from frozen latents (Cube)"
+        cblabel = "Pearson r"
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_title(title, fontsize=11)
     for i in range(pivot.shape[0]):
         for j in range(pivot.shape[1]):
             v = pivot.values[i, j]
             if np.isfinite(v):
                 ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=7)
     cb = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
-    cb.set_label(r"Pearson $r$")
+    cb.set_label(cblabel)
     plt.tight_layout()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+
+def write_heatmap(df: pd.DataFrame, path: str | Path) -> None:
+    pivot = df.pivot_table(index="group", columns="setting", values="pearson")
+    order = [
+        "joint_pos", "joint_vel", "effector_pos", "effector_yaw",
+        "gripper", "block_pos", "block_quat", "block_yaw",
+    ]
+    pivot = pivot.reindex([g for g in order if g in pivot.index])
+    try:
+        _draw_heatmap(pivot, path, usetex=True)
+    except RuntimeError:
+        # dvipng ausente en este entorno: fallback sin LaTeX
+        _draw_heatmap(pivot, path, usetex=False)
 
 
 def parse_args(argv=None):

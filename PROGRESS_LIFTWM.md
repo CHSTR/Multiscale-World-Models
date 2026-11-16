@@ -68,5 +68,7 @@ $P viz/eval_reward.py \
 
 ## Riesgos abiertos
 - Cómputo: escala fina 784 tokens × 4 predictores; vigilar memoria/tiempo en la 3090.
+  - **ViT OOM con batch 64** (23 GB). Fix: `loader.batch_size=32` + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (~12 GB, estable a 2.7 it/s).
+  - Tiempo ViT cube: ~51k steps/epoch × 10 ≈ **52 h** a batch 32. Para iterar rápido: menos epochs, `stem_blocks=1`, `depth=2`, o `stem_patch` mayor (menos tokens, pero re-descarta detalle).
 - `stem_patch` grande podría re-descartar detalle (tradeoff con cómputo) — es la perilla arquitectónica principal.
 - Colapso de representación con lifting aprendible (anti-goal): SIGReg por escala + ablación Stage 1 vs 2 lo vigilan.

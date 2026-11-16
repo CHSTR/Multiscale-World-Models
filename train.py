@@ -12,6 +12,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from jepa_spatial import spatial_losses
+from jepa_pyramid import pyramid_losses
 from module import SIGReg, sigreg_input
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback, StarletVisCallback
 
@@ -31,34 +32,60 @@ def lejepa_forward(self, batch, stage, cfg):
     emb = output["emb"]  # (B, T, D)
     act_emb = output["act_emb"]
 
-    ctx_emb = emb[:, :ctx_len]
     ctx_act = act_emb[:, : ctx_len]
-
-    # label. Con el batch por defecto (T = history_size + num_preds) es igual a
-    # emb[:, n_preds:]; el recorte deja usar batches más largos (p. ej. para
-    # loss.rollout con más pasos) sin cambiar el teacher forcing.
-    tgt_emb = emb[:, n_preds: n_preds + ctx_len]
-    pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
-
-    # LeWM loss
-    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    if lambd > 0:
-        output["sigreg_loss"] = self.sigreg(
-            sigreg_input(emb, cfg.loss.sigreg.get("max_tokens", None))
-        )
-    else:
-        # Sin parámetros entrenables antes de emb (encoder congelado y sin
-        # projector) SIGReg tiene gradiente cero: no se calcula.
-        output["sigreg_loss"] = pred_emb.new_zeros((), dtype=torch.float32)
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
-
-    # JEPA espacial (emb (B,T,N,D)): gate L1, dinámica inversa, rollout y diagnóstico.
     extra_logs = {}
-    if emb.ndim == 4:
-        extra, extra_logs = spatial_losses(
+
+    if isinstance(emb, dict):
+        # LiftWM: latentes por escala. pred_loss = media ponderada por scale_weights;
+        # SIGReg = media entre escalas (mantiene la escala de lambda de un solo término).
+        ctx_emb = {l: v[:, :ctx_len] for l, v in emb.items()}
+        tgt_emb = {l: v[:, n_preds: n_preds + ctx_len] for l, v in emb.items()}
+        pred_emb = self.model.predict(ctx_emb, ctx_act)
+        w = self.model.scale_weights
+        w = w / w.sum()
+        output["pred_loss"] = sum(
+            w[l] * (pred_emb[l] - tgt_emb[l]).pow(2).mean() for l in emb
+        )
+        if lambd > 0:
+            output["sigreg_loss"] = torch.stack([
+                self.sigreg(sigreg_input(emb[l], cfg.loss.sigreg.get("max_tokens", None)))
+                for l in emb
+            ]).mean()
+        else:
+            output["sigreg_loss"] = next(iter(pred_emb.values())).new_zeros((), dtype=torch.float32)
+        output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+        extra, extra_logs = pyramid_losses(
             self.model, batch, emb, pred_emb, tgt_emb, cfg, act_emb=act_emb
         )
         output["loss"] = output["loss"] + extra
+        for l in emb:
+            extra_logs[f"pred_loss_l{l}"] = (pred_emb[l] - tgt_emb[l]).pow(2).mean().detach()
+    else:
+        ctx_emb = emb[:, :ctx_len]
+        # label. Con el batch por defecto (T = history_size + num_preds) es igual a
+        # emb[:, n_preds:]; el recorte deja usar batches más largos (p. ej. para
+        # loss.rollout con más pasos) sin cambiar el teacher forcing.
+        tgt_emb = emb[:, n_preds: n_preds + ctx_len]
+        pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
+
+        # LeWM loss
+        output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+        if lambd > 0:
+            output["sigreg_loss"] = self.sigreg(
+                sigreg_input(emb, cfg.loss.sigreg.get("max_tokens", None))
+            )
+        else:
+            # Sin parámetros entrenables antes de emb (encoder congelado y sin
+            # projector) SIGReg tiene gradiente cero: no se calcula.
+            output["sigreg_loss"] = pred_emb.new_zeros((), dtype=torch.float32)
+        output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+
+        # JEPA espacial (emb (B,T,N,D)): gate L1, dinámica inversa, rollout y diagnóstico.
+        if emb.ndim == 4:
+            extra, extra_logs = spatial_losses(
+                self.model, batch, emb, pred_emb, tgt_emb, cfg, act_emb=act_emb
+            )
+            output["loss"] = output["loss"] + extra
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     losses_dict.update({f"{stage}/{k}": v for k, v in extra_logs.items()})

@@ -1,0 +1,56 @@
+# LiftWM — variante con predictor ViT espacial por escala (en vez de NCA).
+# Idéntico a liftwm.yaml salvo el predictor. Atención espacial no causal + AdaLN-zero
+# con la acción (coherente con el predictor transformer de la rama direct-predictor).
+#
+# Run:
+#   /home/chr/le-wm/.venv/bin/python train.py data=ogb model=liftwm_vit \
+#       loader.batch_size=64 output_model_name=liftwm_vit_cube
+_target_: jepa_pyramid.PyramidJEPA
+
+encoder:
+  _target_: wavelet.pyramid_encoder.PyramidEncoder
+  levels: 3
+  in_channels: 3
+  dims: null
+  stem_blocks: 2
+  stem_patch: 4
+  img_size: ${img_size}
+  learnable_lifting: false
+  heads: 6
+  dim_head: 64
+  dropout: 0.0
+
+predictor:
+  _target_: wavelet.factories.hier_vit
+  n_scales: 4
+  latent_dim: ${embed_dim}
+  act_dim: ${embed_dim}
+  depth: 4
+  heads: 6
+  dim_head: 64
+  mlp_dim: null
+  dropout: 0.1
+  use_velocity: true
+  max_tokens: 4096
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+projector:
+  _target_: wavelet.factories.scale_mlp_dict
+  n_scales: 4
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 1024
+
+pred_proj:
+  _target_: wavelet.factories.scale_mlp_dict
+  n_scales: 4
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 1024
+
+inverse_dynamics: null
+scale_weights: null

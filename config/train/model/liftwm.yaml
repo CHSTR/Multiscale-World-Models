@@ -1,0 +1,60 @@
+# LiftWM — JEPA piramidal multiescala con predictor NCA por escala.
+# Stage 1: lifting Haar FIJO (learnable_lifting=false). Stage 2: learnable_lifting=true.
+#
+# Run (cube es el juez principal; pusht sanity):
+#   /home/chr/le-wm/.venv/bin/python train.py data=ogb model=liftwm \
+#       loader.batch_size=64 output_model_name=liftwm_haar_cube
+#   (batch 64 + grad_checkpoint ya activo para la escala fina de 784 tokens en la 3090)
+#
+# Predictor ViT en vez de NCA:  model=liftwm_vit
+# n_scales debe ser encoder.levels + 1 (levels=3 -> 4 escalas: grids 7/7/14/28).
+_target_: jepa_pyramid.PyramidJEPA
+
+encoder:
+  _target_: wavelet.pyramid_encoder.PyramidEncoder
+  levels: 3
+  in_channels: 3
+  dims: null            # null -> [embed_dim]*4 (192)
+  stem_blocks: 2
+  stem_patch: 4
+  img_size: ${img_size}
+  learnable_lifting: false
+  heads: 6
+  dim_head: 64
+  dropout: 0.0
+
+predictor:
+  _target_: wavelet.factories.hier_nca
+  n_scales: 4
+  latent_dim: ${embed_dim}
+  act_dim: ${embed_dim}
+  hidden_channels: 32
+  update_dim: 256
+  steps: [4, 8]
+  fire_rate: 0.5
+  use_velocity: true
+  gate: false
+  grad_checkpoint: true
+  eval_mode: fixed_mask   # determinista entre candidatos CEM
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+projector:
+  _target_: wavelet.factories.scale_mlp_dict
+  n_scales: 4
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 1024
+
+pred_proj:
+  _target_: wavelet.factories.scale_mlp_dict
+  n_scales: 4
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 1024
+
+inverse_dynamics: null
+scale_weights: null       # null -> unos (uniforme); pondera pred_loss y criterion

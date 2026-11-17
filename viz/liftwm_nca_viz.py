@@ -100,6 +100,9 @@ def internal_gif(model, idx, args):
         per_scale_steps = []
         for l in levels:
             p = model.predictor.predictors[str(l)]
+            old_eval = p.eval_steps
+            if args.steps > 0:
+                p.eval_steps = args.steps   # más pasos internos en inferencia
             gh, gw = model.grid_hw[l]
             x_f = emb[l][0, 0].unsqueeze(0)
             v_f = torch.zeros_like(x_f)
@@ -112,6 +115,7 @@ def internal_gif(model, idx, args):
             per_scale_steps.append([
                 st[0].norm(dim=-1).reshape(gh, gw).float().cpu().numpy() for st in states
             ])
+            p.eval_steps = old_eval
 
     K = len(per_scale_steps[0]) - 1
     clim = []
@@ -187,7 +191,9 @@ def main():
     ap.add_argument("--ckpt", type=str, default="liftwm_nca_cube/weights_epoch_1.pt")
     ap.add_argument("--out", type=str, default="outputs/liftwm_viz")
     ap.add_argument("--fps", type=int, default=6)
-    ap.add_argument("--nsteps", type=int, default=6)
+    ap.add_argument("--nsteps", type=int, default=6, help="pasos del mundo en rollout")
+    ap.add_argument("--steps", type=int, default=0,
+                    help="pasos internos del NCA en el GIF interno (0 = los del ckpt)")
     ap.add_argument("--stride", type=int, default=4)
     ap.add_argument("--mode", choices=["internal", "rollout", "both"], default="both")
     args = ap.parse_args()

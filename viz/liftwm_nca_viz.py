@@ -63,27 +63,37 @@ def fig_to_array(fig):
     return np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
 
 
-def _make_figure(grids, suptitle, cmap, clim, has_real=True):
-    """Crea la figure UNA vez con panel fijo para el real + uno por escala."""
+def _make_figure(grids, suptitle, cmap, clim, has_real=True, clabel=""):
+    """Crea la figure UNA vez con panel fijo para el real + uno por escala + colorbar.
+
+    Todos los paneles comparten la misma escala de color (min/max de los clim
+    por escala), así la única colorbar a la derecha es válida para todos.
+    """
     ns = len(grids)
     ncol = ns + (1 if has_real else 0)
-    fig, axes = plt.subplots(1, ncol, figsize=(3.2 * ncol, 3.7), squeeze=False)
+    fig, axes = plt.subplots(1, ncol, figsize=(3.4 * ncol + 1.0, 3.9), squeeze=False)
     ax = axes[0]
     h_real = None
     if has_real:
         h_real = ax[0].imshow(np.zeros((224, 224, 3)))
         ax[0].set_title("frame real", fontsize=9)
         ax[0].axis("off")
+    vmin = min(c[0] for c in clim)
+    vmax = max(c[1] for c in clim)
     handles = []
     for k in range(ns):
         gh, gw = grids[k]
         h = ax[k + int(has_real)].imshow(np.zeros((gh, gw)), cmap=cmap,
-                                        vmin=clim[k][0], vmax=clim[k][1])
+                                        vmin=vmin, vmax=vmax)
         ax[k + int(has_real)].set_title(f"escala {k} · {gh}×{gw}", fontsize=9)
         ax[k + int(has_real)].axis("off")
         handles.append(h)
     st = fig.suptitle(suptitle, fontsize=11)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 0.88, 1.0))
+    cax = fig.add_axes([0.90, 0.15, 0.018, 0.70])
+    cb = fig.colorbar(handles[0], cax=cax)
+    cb.set_label(clabel, fontsize=9)
+    cb.ax.tick_params(labelsize=8)
     return fig, h_real, handles, st
 
 
@@ -124,7 +134,8 @@ def internal_gif(model, idx, args):
         clim.append((float(np.percentile(pool, 2)), float(np.percentile(pool, 98))))
 
     fig, h_real, handles, st = _make_figure(
-        grids, "NCA dinámica celular interna — paso 0", "viridis", clim)
+        grids, "NCA dinámica celular interna — paso 0", "viridis", clim,
+        clabel="‖latente‖₂")
     h_real.set_data(img.permute(1, 2, 0).numpy())
     frames = []
     for i in range(K + 1):
@@ -169,7 +180,8 @@ def rollout_gif(model, idx, args):
         clim.append((0.0, float(np.percentile(pool, 98)) or 1.0))
 
     fig, h_real, handles, st = _make_figure(
-        grids, "NCA rollout — error |pred−real| paso 1", "magma", clim)
+        grids, "NCA rollout — error |pred−real| paso 1", "magma", clim,
+        clabel="‖pred − real‖₂")
     frames = []
     for t in range(T):
         h_real.set_data(true_imgs[t].permute(1, 2, 0).numpy())

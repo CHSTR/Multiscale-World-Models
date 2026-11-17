@@ -155,19 +155,25 @@ def make_tokens_gif(args):
     vmin = [float(np.percentile(p, 2)) for p in pool]
     vmax = [float(np.percentile(p, 98)) or 1.0 for p in pool]
 
-    fig, axes = plt.subplots(1, ns + 1, figsize=(3.2 * (ns + 1), 3.8))
+    fig, axes = plt.subplots(1, ns + 1, figsize=(3.4 * (ns + 1) + 1.0, 3.9))
     h_orig = axes[0].imshow(frames[0].permute(1, 2, 0).numpy())
     axes[0].set_title("original", fontsize=10)
     axes[0].axis("off")
+    vmin = min(vmin)
+    vmax = max(vmax)
     handles = []
     for k in range(ns):
         gh, gw = grids[k]
-        h = axes[k + 1].imshow(norms[0][k], cmap="viridis", vmin=vmin[k], vmax=vmax[k])
+        h = axes[k + 1].imshow(norms[0][k], cmap="viridis", vmin=vmin, vmax=vmax)
         axes[k + 1].set_title(f"escala {k} · {gh}×{gw}", fontsize=10)
         axes[k + 1].axis("off")
         handles.append(h)
     st = fig.suptitle("Tokens del encoder por escala", fontsize=12)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 0.88, 1.0))
+    cax = fig.add_axes([0.90, 0.15, 0.018, 0.70])
+    cb = fig.colorbar(handles[0], cax=cax)
+    cb.set_label("‖token‖₂", fontsize=9)
+    cb.ax.tick_params(labelsize=8)
 
     arrays = []
     for t, img in enumerate(frames):
@@ -175,7 +181,7 @@ def make_tokens_gif(args):
         for k in range(ns):
             handles[k].set_data(norms[t][k])
         st.set_text(f"Tokens del encoder por escala — frame {t + 1}/{len(frames)} "
-                    f"(norma, clim fijo por escala)")
+                    f"(norma, escala de color compartida)")
         arrays.append(fig_to_array(fig))
     plt.close(fig)
     out = os.path.join(args.out, f"tokens_traj_idx{args.idx}.gif")

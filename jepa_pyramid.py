@@ -138,6 +138,32 @@ class PyramidJEPA(JEPA):
             cost = w[l] * c if cost is None else cost + w[l] * c
         return cost
 
+    def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
+        """Igual que ``JEPA.get_cost`` pero robusto a ``goal_emb`` dict.
+
+        El bucle que renombra las claves ``goal_*`` sólo opera sobre claves que
+        son tensores (presentes en ``goal``); ``goal_emb`` aquí es un dict por
+        escala y no debe intentar popearse. Sin esto, la 2ª iteración del CEM
+        (que reutiliza ``info_dict`` con ``goal_emb`` ya puesto) da KeyError.
+        """
+        assert "goal" in info_dict, "goal not in info_dict"
+        device = next(self.parameters()).device
+        for k in list(info_dict.keys()):
+            if torch.is_tensor(info_dict[k]):
+                info_dict[k] = info_dict[k].to(device)
+
+        goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
+        goal["pixels"] = goal["goal"]
+        for k in list(info_dict.keys()):
+            if k.startswith("goal_") and k in goal:
+                goal[k[len("goal_"):]] = goal.pop(k)
+        goal.pop("action", None)
+        goal = self.encode(goal)
+
+        info_dict["goal_emb"] = goal["emb"]
+        info_dict = self.rollout(info_dict, action_candidates)
+        return self.criterion(info_dict)
+
 
 def _cfg_get(loss_cfg, name, key, default):
     return (loss_cfg.get(name, None) or {}).get(key, default)

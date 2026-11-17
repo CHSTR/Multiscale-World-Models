@@ -17,6 +17,10 @@ class MockEnc(nn.Module):
 
 
 class MockPred(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(1))
+
     def forward(self, emb, act_emb, grid_hw, only_last=False):
         return {l: (v[:, :1] if only_last else v) for l, v in emb.items()}
 
@@ -72,6 +76,22 @@ def test_sigreg_per_scale_shape():
     emb_l = torch.randn(2, 3, 196, 192)
     x = sigreg_input(emb_l, max_tokens=8)
     assert x.shape[0] == 3 and x.shape[-1] == 192 and x.shape[1] <= 2 * 8
+
+
+def test_get_cost_repeated_calls():
+    # Regresión: el CEM reutiliza info_dict entre iteraciones; goal_emb queda como
+    # dict y no debe romper el renombrado de claves goal_* (KeyError en la 2ª llamada).
+    m = _model()
+    B, S, H, T = 1, 2, 3, 5
+    info = {
+        "pixels": torch.randn(B, S, H, 3, 224, 224),
+        "goal": torch.randn(B, S, 1, 3, 224, 224),
+        "action": torch.randn(B, S, H, 4),
+    }
+    cand = torch.randn(B, S, T, 4)
+    c1 = m.get_cost(info, cand)
+    c2 = m.get_cost(info, cand)
+    assert c1.shape == (B, S) and c2.shape == (B, S)
 
 
 def test_pyramid_losses_runs():

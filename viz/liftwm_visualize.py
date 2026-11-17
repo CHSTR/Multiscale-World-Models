@@ -135,6 +135,54 @@ def make_gif(args):
     print(f"GIF pirámide lifting ({len(arrays)} frames) ->", out)
 
 
+def make_tokens_gif(args):
+    """GIF de las normas de tokens del encoder entrenado por escala, en el tiempo."""
+    import imageio.v2 as imageio
+    model = swm.wm.utils.load_pretrained(args.ckpt).to("cpu").eval()
+    frames = get_trajectory(args.idx, args.nframes, args.stride)
+
+    norms, grids = [], None
+    with torch.no_grad():
+        for img in frames:
+            po = model.encoder(img.unsqueeze(0))
+            grids = [s.grid_hw for s in po.scales]
+            norms.append([s.tokens[0].norm(dim=-1).reshape(s.grid_hw).float().cpu().numpy()
+                          for s in po.scales])
+    ns = len(grids)
+    # clim fijo por escala (percentiles sobre toda la trayectoria) para que el
+    # cambio sea visible sin saturar: vmin/vmin robustos a outliers.
+    pool = [np.concatenate([n[k].ravel() for n in norms]) for k in range(ns)]
+    vmin = [float(np.percentile(p, 2)) for p in pool]
+    vmax = [float(np.percentile(p, 98)) or 1.0 for p in pool]
+
+    fig, axes = plt.subplots(1, ns + 1, figsize=(3.2 * (ns + 1), 3.8))
+    h_orig = axes[0].imshow(frames[0].permute(1, 2, 0).numpy())
+    axes[0].set_title("original", fontsize=10)
+    axes[0].axis("off")
+    handles = []
+    for k in range(ns):
+        gh, gw = grids[k]
+        h = axes[k + 1].imshow(norms[0][k], cmap="viridis", vmin=vmin[k], vmax=vmax[k])
+        axes[k + 1].set_title(f"escala {k} · {gh}×{gw}", fontsize=10)
+        axes[k + 1].axis("off")
+        handles.append(h)
+    st = fig.suptitle("Tokens del encoder por escala", fontsize=12)
+    fig.tight_layout()
+
+    arrays = []
+    for t, img in enumerate(frames):
+        h_orig.set_data(img.permute(1, 2, 0).numpy())
+        for k in range(ns):
+            handles[k].set_data(norms[t][k])
+        st.set_text(f"Tokens del encoder por escala — frame {t + 1}/{len(frames)} "
+                    f"(norma, clim fijo por escala)")
+        arrays.append(fig_to_array(fig))
+    plt.close(fig)
+    out = os.path.join(args.out, f"tokens_traj_idx{args.idx}.gif")
+    imageio.mimsave(out, arrays, duration=1.0 / args.fps, loop=0)
+    print(f"GIF tokens por escala ({len(arrays)} frames) ->", out)
+
+
 def tokens_fig(model, img: torch.Tensor, out: str):
     device = next(model.parameters()).device
     with torch.no_grad():
@@ -160,7 +208,8 @@ def main():
     ap.add_argument("--ckpt", type=str, default="liftwm_vit_cube/weights_epoch_1.pt")
     ap.add_argument("--out", type=str, default="outputs/liftwm_viz")
     ap.add_argument("--levels", type=int, default=3)
-    ap.add_argument("--gif", action="store_true", help="GIF de la pirámide en el tiempo")
+    ap.add_argument("--gif", action="store_true", help="GIF de la pirámide lifting en el tiempo")
+    ap.add_argument("--tokens-gif", action="store_true", help="GIF de tokens del encoder por escala")
     ap.add_argument("--nframes", type=int, default=24)
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--fps", type=int, default=8)
@@ -170,6 +219,10 @@ def main():
 
     if args.gif:
         make_gif(args)
+        return
+
+    if args.tokens_gif:
+        make_tokens_gif(args)
         return
 
     img = get_frame(args.idx)

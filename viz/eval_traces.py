@@ -150,6 +150,7 @@ def evaluate_with_traces(
     tr_terminated: list[np.ndarray] = []
     tr_reward: list[np.ndarray] = []
     tr_step_idx: list[np.ndarray] = []
+    tr_pixels: list[np.ndarray] = []
 
     pbar = tqdm(total=eval_budget, desc="eval planning", unit="step", leave=True)
 
@@ -178,6 +179,10 @@ def evaluate_with_traces(
         # el env se congela y deja de reportar True después).
         tr_terminated.append(np.asarray(w.terminateds, dtype=bool).copy())
         tr_reward.append(np.asarray(w.rewards, dtype=float).copy())
+        # Píxeles por paso (diezmados a 112×112 para no inflar el .npz).
+        px = np.asarray(w.infos.get("pixels"))
+        if px.ndim == 4:
+            tr_pixels.append(px[:, ::2, ::2].astype(np.uint8).copy())
 
     world._run(max_steps=eval_budget, mode="wait", on_step=on_step)
     pbar.close()
@@ -189,6 +194,8 @@ def evaluate_with_traces(
         "reward": np.stack(tr_reward),           # (T, n)
         "step_idx": np.stack(tr_step_idx),       # (T, n)
     }
+    if tr_pixels:
+        traces["pixels"] = np.stack(tr_pixels)   # (T, n, 112, 112, 3)
     if tr_proprio:
         # posición del agente DESPUÉS de cada paso. La posición ANTES del paso t
         # es start_pos para t=0 y proprio[t-1] para t>0 (útil para anclar flechas).

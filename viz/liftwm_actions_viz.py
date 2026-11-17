@@ -54,7 +54,8 @@ def main():
     env = pick_env(d, args.env)
     acts = d["trace_action"][env]                 # (T, A)
     dist = d["trace_distance"][env]                # (T,)
-    bg = d["geo_background_image"][env]            # (H, W, 3)
+    bg = d["geo_background_image"][env]            # (H, W, 3) fondo estático
+    real_frames = d["trace_pixels"][:, env] if "trace_pixels" in d else None  # (T,h,w,3)
     T, A = acts.shape
     steps = np.arange(T)
     vmax = float(np.max(np.abs(acts))) or 1.0
@@ -62,9 +63,10 @@ def main():
     fig, axes = plt.subplots(1, 4, figsize=(16, 4.2),
                             gridspec_kw={"width_ratios": [1.1, 1.0, 2.0, 1.4]})
 
-    # panel 1: frame real
-    axes[0].imshow(bg)
-    axes[0].set_title("frame real", fontsize=9)
+    # panel 1: frame real (o fondo estático si el eval no guardó píxeles)
+    h_real = axes[0].imshow(real_frames[0] if real_frames is not None else bg)
+    axes[0].set_title("frame real" if real_frames is not None
+                      else "background (estático)", fontsize=9)
     axes[0].axis("off")
 
     # panel 2: barras de la acción actual
@@ -98,6 +100,8 @@ def main():
 
     frames = []
     for t in range(T):
+        if real_frames is not None:
+            h_real.set_data(real_frames[t])
         for b, v in zip(bars, acts[t]):
             b.set_height(v)
         vline.set_xdata([t, t])

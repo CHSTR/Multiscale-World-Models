@@ -56,7 +56,7 @@ def _show(ax, t, title, diverging=False):
     ax.axis("off")
 
 
-def pyramid_fig(img: torch.Tensor, levels: int, out: str):
+def build_pyramid_fig(img: torch.Tensor, levels: int):
     lift = LiftingScheme(levels=levels, in_channels=3, init="haar", learnable=False)
     p = lift(img.unsqueeze(0))
     C = img.shape[0]
@@ -82,11 +82,57 @@ def pyramid_fig(img: torch.Tensor, levels: int, out: str):
         _show(axes[r, 2], HL, f"HL (vertical)", diverging=True)
         _show(axes[r, 3], HH, f"HH (diagonal)", diverging=True)
 
+    fig.tight_layout()
+    return fig
+
+
+def pyramid_fig(img: torch.Tensor, levels: int, out: str):
+    fig = build_pyramid_fig(img, levels)
     fig.suptitle("Pirámide lifting (Haar, L=3): aproximación + sub-bandas de detalle por escala\n"
                  "(detalle en colormap divergente; fino arriba-de-abajo en resolución)", fontsize=11)
     fig.tight_layout()
     fig.savefig(out, dpi=120, bbox_inches="tight")
     plt.close(fig)
+
+
+def fig_to_array(fig) -> np.ndarray:
+    fig.canvas.draw()
+    return np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+
+
+def get_trajectory(idx: int, nframes: int, stride: int, size: int = 224):
+    """Frames consecutivos de un mismo episodio (ordenados por step_idx)."""
+    ds = swm.data.load_dataset("ogbench/cube_single_expert.h5", keys_to_cache=["action"])
+    col = "episode_idx" if "episode_idx" in ds.column_names else "ep_idx"
+    ep = ds.get_col_data(col)
+    step = ds.get_col_data("step_idx")
+    target_ep = ep[idx]
+    rows = np.where(ep == target_ep)[0]
+    rows = rows[np.argsort(step[rows])]
+    pos = int(np.where(rows == idx)[0][0])
+    sel = rows[pos:pos + nframes * stride:stride]
+    tf = transforms.Compose([
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
+        transforms.Resize(size),
+    ])
+    return [tf(ds.get_row_data(int(i))["pixels"]) for i in sel]
+
+
+def make_gif(args):
+    import imageio.v2 as imageio
+    frames_px = get_trajectory(args.idx, args.nframes, args.stride)
+    arrays = []
+    for t, img in enumerate(frames_px):
+        fig = build_pyramid_fig(img, args.levels)
+        fig.suptitle(f"Pirámide lifting en el tiempo — frame {t + 1}/{len(frames_px)} "
+                     f"(Haar, L={args.levels})", fontsize=12)
+        fig.tight_layout()
+        arrays.append(fig_to_array(fig))
+        plt.close(fig)
+    out = os.path.join(args.out, f"pyramid_traj_idx{args.idx}.gif")
+    imageio.mimsave(out, arrays, duration=1.0 / args.fps, loop=0)
+    print(f"GIF pirámide lifting ({len(arrays)} frames) ->", out)
 
 
 def tokens_fig(model, img: torch.Tensor, out: str):
@@ -114,9 +160,18 @@ def main():
     ap.add_argument("--ckpt", type=str, default="liftwm_vit_cube/weights_epoch_1.pt")
     ap.add_argument("--out", type=str, default="outputs/liftwm_viz")
     ap.add_argument("--levels", type=int, default=3)
+    ap.add_argument("--gif", action="store_true", help="GIF de la pirámide en el tiempo")
+    ap.add_argument("--nframes", type=int, default=24)
+    ap.add_argument("--stride", type=int, default=2)
+    ap.add_argument("--fps", type=int, default=8)
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
+
+    if args.gif:
+        make_gif(args)
+        return
+
     img = get_frame(args.idx)
 
     pout = os.path.join(args.out, f"pyramid_idx{args.idx}.png")

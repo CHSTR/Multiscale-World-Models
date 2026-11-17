@@ -1,0 +1,13 @@
+# ConvNeXt-MS desde cero: misma arquitectura que convnext_ms.yaml, init aleatoria
+# y backbone completo entrenable (end-to-end, estilo LeWM).
+#
+# Run:
+#   python train.py data=ogb model=convnext_ms_scratch output_model_name=cnms_scratch_cube
+defaults:
+  - convnext_ms
+  - _self_
+
+encoder:
+  init: scratch
+  finetune: full
+  drop_path_rate: 0.1

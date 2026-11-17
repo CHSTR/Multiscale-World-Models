@@ -1,0 +1,74 @@
+# ConvNeXt-MS: world model multiescala con las etapas de ConvNeXt como escalas.
+#
+# Mismo PyramidJEPA / predictor ViT por escala / costo CEM por escala que
+# liftwm_vit.yaml; sólo cambia el encoder (pirámide wavelet -> etapas ConvNeXt).
+#
+# Por defecto: DINOv3 ConvNeXt-tiny + LoRA, etapas [1,2,3] -> grillas 28/14/7
+# (784/196/49 tokens), level 0 = más gruesa.
+#
+# Run:
+#   python train.py data=ogb model=convnext_ms output_model_name=cnms_dinov3_cube
+# Variantes (overrides):
+#   desde cero:          model=convnext_ms_scratch
+#   finetune completo:   model.encoder.finetune=full
+#   backbone congelado:  model.encoder.finetune=frozen
+#   más barato:          model.encoder.out_grids=[7,14,14]     (fina 784 -> 196 tokens)
+#   otro tamaño:         model.encoder.size=small|base|large
+#   2 escalas:           model.encoder.stages=[2,3] y n_scales=2 en predictor/projector/pred_proj
+#   ckpt local:          model.encoder.ckpt_path=/ruta/dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth
+#                        (o export DINOV3_CONVNEXT_CKPT=<ruta>)
+#
+# IMPORTANTE: n_scales (predictor/projector/pred_proj) == len(encoder.stages).
+_target_: jepa_pyramid.PyramidJEPA
+
+encoder:
+  _target_: src.encoders.convnext_pyramid_encoder.ConvNeXtPyramidEncoder
+  size: tiny                 # tiny | small | base | large
+  init: dinov3               # dinov3 | scratch
+  ckpt_path: null            # null = $DINOV3_CONVNEXT_CKPT o descarga por hub
+  finetune: lora             # lora | full | frozen   (init=dinov3)
+  stages: [1, 2, 3]          # etapas ConvNeXt usadas como escalas (0..3)
+  out_dim: ${embed_dim}
+  out_grids: null            # p.ej. [7, 14, 14] (gruesa -> fina) para limitar tokens
+  img_size: ${img_size}
+  drop_path_rate: 0.0
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_targets: ["pwconv1", "pwconv2"]
+  starlet_levels: 0          # >0: frontend starlet antes del stem (ablación)
+
+predictor:
+  _target_: wavelet.factories.hier_vit
+  n_scales: 3
+  latent_dim: ${embed_dim}
+  act_dim: ${embed_dim}
+  depth: 4
+  heads: 6
+  dim_head: 64
+  mlp_dim: null
+  dropout: 0.1
+  use_velocity: true
+  max_tokens: 4096
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+projector:
+  _target_: wavelet.factories.scale_mlp_dict
+  n_scales: 3
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 1024
+
+pred_proj:
+  _target_: wavelet.factories.scale_mlp_dict
+  n_scales: 3
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 1024
+
+inverse_dynamics: null
+scale_weights: null          # [w_gruesa, w_media, w_fina]; pondera pred_loss y costo CEM

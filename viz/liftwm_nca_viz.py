@@ -151,7 +151,8 @@ def internal_gif(model, idx, args):
     print(f"GIF NCA interno ({K + 1} pasos) ->", out_path)
 
 
-def rollout_gif(model, idx, args):
+def rollout_gif(model, idx, args, what="error"):
+    """what="error" -> mapa |pred−real|; what="pred" -> norma del latente predicho."""
     A = model.action_encoder.patch_embed.in_channels
     B, T = 1, args.nsteps
     with torch.no_grad():
@@ -162,39 +163,46 @@ def rollout_gif(model, idx, args):
         act_seq = model.action_encoder(torch.zeros(B, T, A))
         pred = model.predict_rollout(ctx, act_seq, history=1)
 
-        true_imgs, true = [], {}
-        for t in range(1, T + 1):
-            im, _ = get_frame_action(idx + t * args.stride)
-            true_imgs.append(im)
-            o2 = model.encode({"pixels": im.unsqueeze(0).unsqueeze(0)})
-            for l in o2["emb"]:
-                true.setdefault(l, []).append(o2["emb"][l][:, 0])
-        err = {l: torch.stack([(pred[l][0, t] - true[l][t]).abs().norm(dim=-1)
-                               for t in range(T)]).float().cpu().numpy() for l in pred}
+        true_imgs = [get_frame_action(idx + t * args.stride)[0] for t in range(1, T + 1)]
+        if what == "error":
+            true = {}
+            for t in range(1, T + 1):
+                o2 = model.encode({"pixels": true_imgs[t - 1].unsqueeze(0).unsqueeze(0)})
+                for l in o2["emb"]:
+                    true.setdefault(l, []).append(o2["emb"][l][:, 0])
+            vals = {l: torch.stack([(pred[l][0, t] - true[l][t]).abs().norm(dim=-1)
+                                    for t in range(T)]).float().cpu().numpy() for l in pred}
+            cmap, clabel = "magma", "‖pred − real‖₂"
+            base, fname = "NCA rollout — error |pred−real|", f"nca_rollout_idx{idx}.gif"
+        else:
+            vals = {l: torch.stack([pred[l][0, t].norm(dim=-1)
+                                    for t in range(T)]).float().cpu().numpy() for l in pred}
+            cmap, clabel = "viridis", "‖predicho‖₂"
+            base, fname = "NCA rollout — latente predicho", f"nca_pred_idx{idx}.gif"
 
-    levels = sorted(err)
+    levels = sorted(vals)
     grids = [model.grid_hw[l] for l in levels]
     clim = []
     for l in levels:
-        pool = err[l].ravel()
-        clim.append((0.0, float(np.percentile(pool, 98)) or 1.0))
+        pool = vals[l].ravel()
+        lo = 0.0 if what == "error" else float(np.percentile(pool, 2))
+        clim.append((lo, float(np.percentile(pool, 98)) or 1.0))
 
-    fig, h_real, handles, st = _make_figure(
-        grids, "NCA rollout — error |pred−real| paso 1", "magma", clim,
-        clabel="‖pred − real‖₂")
+    fig, h_real, handles, st = _make_figure(grids, f"{base} — paso 1", cmap, clim,
+                                            clabel=clabel)
     frames = []
     for t in range(T):
         h_real.set_data(true_imgs[t].permute(1, 2, 0).numpy())
         for k, l in enumerate(levels):
-            handles[k].set_data(err[l][t].reshape(model.grid_hw[l]))
-        st.set_text(f"NCA rollout — error |pred−real| paso {t + 1}/{T} del mundo")
+            handles[k].set_data(vals[l][t].reshape(model.grid_hw[l]))
+        st.set_text(f"{base} — paso {t + 1}/{T} del mundo")
         frames.append(fig_to_array(fig))
     plt.close(fig)
 
     import imageio.v2 as imageio
-    out_path = os.path.join(args.out, f"nca_rollout_idx{idx}.gif")
+    out_path = os.path.join(args.out, fname)
     imageio.mimsave(out_path, frames, duration=1.0 / args.fps, loop=0)
-    print(f"GIF NCA rollout ({T} pasos) ->", out_path)
+    print(f"GIF NCA {what} ({T} pasos) ->", out_path)
 
 
 def main():
@@ -207,7 +215,7 @@ def main():
     ap.add_argument("--steps", type=int, default=0,
                     help="pasos internos del NCA en el GIF interno (0 = los del ckpt)")
     ap.add_argument("--stride", type=int, default=4)
-    ap.add_argument("--mode", choices=["internal", "rollout", "both"], default="both")
+    ap.add_argument("--mode", choices=["internal", "rollout", "pred", "both"], default="both")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -215,7 +223,9 @@ def main():
     if args.mode in ("internal", "both"):
         internal_gif(model, args.idx, args)
     if args.mode in ("rollout", "both"):
-        rollout_gif(model, args.idx, args)
+        rollout_gif(model, args.idx, args, what="error")
+    if args.mode == "pred":
+        rollout_gif(model, args.idx, args, what="pred")
 
 
 if __name__ == "__main__":

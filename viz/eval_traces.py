@@ -28,6 +28,7 @@ from copy import deepcopy
 from typing import Any
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from stable_worldmodel.world.world import _apply_callables, _extract_init_goal
 
@@ -150,7 +151,10 @@ def evaluate_with_traces(
     tr_reward: list[np.ndarray] = []
     tr_step_idx: list[np.ndarray] = []
 
+    pbar = tqdm(total=eval_budget, desc="eval planning", unit="step", leave=True)
+
     def on_step(w) -> None:
+        pbar.update(1)
         w.infos.update(deepcopy(goal_snapshot))  # re-inyectar goal
 
         if has_distance:
@@ -176,6 +180,7 @@ def evaluate_with_traces(
         tr_reward.append(np.asarray(w.rewards, dtype=float).copy())
 
     world._run(max_steps=eval_budget, mode="wait", on_step=on_step)
+    pbar.close()
 
     traces = {
         "distance": np.stack(tr_distance),       # (T, n)

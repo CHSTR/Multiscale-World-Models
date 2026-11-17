@@ -125,7 +125,7 @@ def make_gif(args):
     arrays = []
     for t, img in enumerate(frames_px):
         fig = build_pyramid_fig(img, args.levels)
-        fig.suptitle(f"Pirámide lifting en el tiempo — frame {t + 1}/{len(frames_px)} "
+        fig.suptitle(f"Pirámide lifting en el tiempo — frame {t + 1:02d}/{len(frames_px):02d} "
                      f"(Haar, L={args.levels})", fontsize=12)
         fig.tight_layout()
         arrays.append(fig_to_array(fig))

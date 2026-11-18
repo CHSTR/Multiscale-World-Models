@@ -1,5 +1,15 @@
 # Diseño: banco sintético multiescala "MSWorld" (fase 1, offline)
 
+> **SUPERSEDED (2026-11-18):** reemplazado por el entorno **MultiScaleDial**
+> (spec en `/home/chr/Documents/multiescala_env/multiscale-env-spec.md`, que
+> se integrará al repo). Su diseño es superior: escala como variable
+> independiente (curva dosis-respuesta Δ(k) con k=1..4), dial "balanced" con
+> dipolo nulo (sin fuga de información fina a bandas gruesas), metas 2×2
+> coarse/fine/both sobre el mismo modelo, y gym env con `set_state` que une
+> diagnóstico offline y eval CEM pareada. Se conservan de este doc: el split
+> por episodio (train/val separados) y la lección de medir energía por banda
+> con sumas (Parseval).
+
 ## Intent y por qué
 
 Los benchmarks actuales no pueden separar "lo multiescala aporta" de "lo
@@ -150,12 +160,12 @@ multiescala; se entrena solo para la variante multiescala que mejor dé en
 `cluttered`) × {lewm, la mejor multiescala} × 3 seeds = 18 runs opcionales,
 se corren después de `both`, solo si `both` muestra separación.
 
-**Regla de recorte si el cómputo aprieta** (una sola GPU): primero se baja
-el budget por run (epochs), después se recortan variantes en este orden:
-`wave_vit` → `swt` (quedan `starlet` + `liftwm` + `convnext_ms` como
-representantes multiescala, y `lewm`/`lewm-ds` como baselines). Las
-comparaciones que deben sobrevivir cualquier recorte: `both` × {lewm,
-lewm-ds, starlet, liftwm} × 3 seeds.
+**Regla de recorte si el cómputo aprieta** (una sola GPU, budget aprobado:
+**2 epochs por run**): primero se baja el budget por run, después se
+recortan variantes en este orden: `wave_vit` → `swt` (quedan `starlet` +
+`liftwm` + `convnext_ms` como representantes multiescala, y `lewm`/`lewm-ds`
+como baselines). Las comparaciones que deben sobrevivir cualquier recorte:
+`both` × {lewm, lewm-ds, starlet, liftwm} × 3 seeds.
 
 ## Juez (métricas offline, portadas de `exp/multiscale-diagnostics`)
 
@@ -167,12 +177,13 @@ por episodio) aplicado autoregresivamente sobre el rollout, y medir el error
 de posición en el espacio del estado a horizontes 1/5/10. Los targets están
 en unidades físicas (px), comparables entre modelos.
 
-**Regla de decisión (fase 1):** la multiescala *gana* si en `both` su
+**Regla de decisión (fase 1, aprobada):** la multiescala *gana* si en `both` su
 state-rollout error (media de 3 seeds) supera al de `lewm` con separación
 mayor que el spread entre seeds; *pierde* si queda claramente abajo en
 `both`; si emparda en `both` pero también en los controles, el veredicto es
-"no aporta". `band_importance` es el chequeo de mecanismo (dice *por qué*),
-no el veredicto.
+"no aporta". `cluttered` se reporta como evidencia secundaria (si la brecha
+crece con distractores) pero **no** es requisito para declarar victoria.
+`band_importance` es el chequeo de mecanismo (dice *por qué*), no el veredicto.
 
 1. **band_importance (modo `noise`):** Δ pérdida de predicción por banda con
    la estadística preservada — diagnóstico **dentro** de cada checkpoint

@@ -1,6 +1,6 @@
 # TODO MultiScaleDial — estado en vivo
 
-Actualizado: 2026-11-18 ~16:12 (hora local)
+Actualizado: 2026-11-18 ~16:40 (hora local)
 
 ## Hecho
 
@@ -17,16 +17,17 @@ Actualizado: 2026-11-18 ~16:12 (hora local)
 
 ## En curso (background)
 
-- [ ] **T7.1** Recolección dataset k=1: `msdial_train_k1_balanced.h5` (4.7 / ~13.3 GB, ~36%) → ETA ~17:20
-- [ ] **T7.1b** Recolección datasets **k=2 y k=3** + sus sets de eval (paralelo, CPU) → ETA ~17:50
-- [ ] **T7.2** Cadena piloto (`scripts/run_pilot_k1.sh`, PID 82153): espera k=1 → mueve al externo + symlink → entrena `lewm` k=1 (2 ep, ~15 min) → eval CEM 3 modos (50 eps) → sonda R²
+- [x] ~~k=1 primera recolección~~ → **matada por timeout de 1 h** (16:31). La cadena del piloto lanzó un `mv` en plena escritura de k2/k3: detenido a tiempo, copia parcial borrada, fuentes intactas.
+- [ ] **T7.1** Recolección dataset k=1 (RELANZADA, PID 101481, timeout 3 h): ETA ~18:10–18:45
+- [ ] **T7.1b** Recolección datasets **k=2 y k=3** + sets de eval (siguen vivas desde 16:05): ETA ~17:05
+- [ ] **T7.2** Cadena piloto blindada (`scripts/run_pilot_k1.sh`, PID 101611): espera los **tres** collectors → **verifica integridad de los H5** → mueve al externo + symlink → entrena `lewm` k=1 (2 ep) → eval 3 modos (50 eps) → sonda R²
 - [ ] **T7.3** Gate de sanidad: `coarse` cerca del oráculo (≥90% pos), `fine` > piso por azar (~9.5%), R²(θ) > 0.5 → decide si se lanza el barrido de 12 h
 
 ## Pendiente (barrido 12 h)
 
 - [ ] **Fase A** k=2 × 12 brazos × seed 0 (~5.5 h): lewm, lewm_s8, lewm_rgbrep, starlet, swt, wave_vit, convnext_ms, dinov2_lora, dinov2_starlet_lora, dinov3_lora, dinov3_starlet_lora, dinov3_convnext_tiny
 - [ ] **Fase B** k=1 y k=3 × {lewm, starlet, convnext_ms} × seed 0 (~2 h) → curva Δ(k) de 3 puntos
-- [ ] **Fase C** Evals 2 modos (coarse/fine) × 30 eps por run (~3 h; se ajusta con el tiempo real del piloto)
+- [ ] **Fase C** Evals **fine × 30 eps** por run (~1.5 h; recortada para entrar en las 12 h por el retraso del incidente; se agrega coarse si el piloto mide eval rápido)
 - [ ] Reporte agregado: tabla por familia, Δ(k), sondas R²(θ)
 - [ ] Review final del branch + cierre de rama
 

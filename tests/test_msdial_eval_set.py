@@ -84,6 +84,17 @@ def test_eval_mode_semantics():
                 assert dpos > 0.3 and np.pi / 2 <= dth <= np.pi
 
 
+def test_meta_merge_across_levels(tmp_path):
+    """Generar otro nivel en el mismo dir no debe borrar las entradas previas."""
+    import swm_msdial.gen_eval_set as g
+
+    g.gen_eval_set((2,), "balanced", 2, seed=0, out_dir=tmp_path, modes=("fine",))
+    g.gen_eval_set((3,), "balanced", 2, seed=0, out_dir=tmp_path, modes=("fine",))
+    meta = json.loads((tmp_path / "eval_meta.json").read_text())
+    assert "msdial_eval_k2_balanced_fine.h5" in meta["sets"]
+    assert "msdial_eval_k3_balanced_fine.h5" in meta["sets"]
+
+
 def test_eval_goal_pixels_render():
     # los pixels de la fila 25 se renderizaron EN el estado goal
     with h5py.File(_load("fine")) as f_fine, h5py.File(_load("coarse")) as f_co:

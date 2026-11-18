@@ -106,8 +106,18 @@ def gen_eval_set(levels, style, episodes, seed, out_dir,
             pairs.append((start.copy(), goal.copy()))
         write(mode, pairs)
 
-    (out / "eval_meta.json").write_text(json.dumps(meta, indent=2))
-    print("meta ->", out / "eval_meta.json")
+    # merge con misma ruta: generar otro nivel no debe borrar las entradas previas
+    meta_path = out / "eval_meta.json"
+    if meta_path.exists():
+        try:
+            prev = json.loads(meta_path.read_text())
+            sets = prev.get("sets", {})
+            sets.update(meta["sets"])
+            meta["sets"] = sets
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    meta_path.write_text(json.dumps(meta, indent=2))
+    print("meta ->", meta_path)
 
 
 def main():

@@ -12,8 +12,8 @@ acumulados por episodio (los lee la eval para el éxito por componente).
 Estado:   p ∈ [R, 1-R]^2 (posición del cuerpo, escala gruesa)
           θ_k ∈ S^1 para cada nivel k en `levels` (diales anidados, escala ~ 2^-k)
 Acción:   a ∈ [-1, 1]^(2 + K)  -> (dx, dy, dθ_1, ..., dθ_K)
-Obs:      {"pixels": uint8 HxWx3, "state": float32 [p, sin θ, cos θ]}
-Info:     {"state": float64 [p, θ] crudo (para callables/controlador),
+Obs:      {"state": float32 [p, sin θ, cos θ]}  (pixels los agrega el wrapper swm)
+Info:     {"agent_state": float64 [p, θ] crudo (para callables/controlador),
           "success_pos"/"success_dial": bool del paso,
           "ever_pos"/"ever_dial": bool OR acumulado del episodio,
           "dpos": float, "dth_max": float} (None si no hay goal fijado)
@@ -92,7 +92,6 @@ class MultiScaleDialEnv(gym.Env):
 
         self.action_space = spaces.Box(-1.0, 1.0, (2 + self.K,), np.float32)
         self.observation_space = spaces.Dict(
-            pixels=spaces.Box(0, 255, (self.H, self.H, 3), np.uint8),
             state=spaces.Box(-np.inf, np.inf, (2 + 2 * self.K,), np.float32),
         )
 
@@ -141,8 +140,11 @@ class MultiScaleDialEnv(gym.Env):
         return np.concatenate([pos, th])
 
     def _obs(self):
+        # Solo "state" ([p, sin, cos], spec §1): los pixels los agrega
+        # AddPixelsWrapper de swm via render() — exponerlos acá colisionaría
+        # (EverythingToInfoWrapper hace assert key not in info).
         st = np.concatenate([self.pos, np.sin(self.theta), np.cos(self.theta)]).astype(np.float32)
-        return {"pixels": self.render(), "state": st}
+        return {"state": st}
 
     # ---------- gym API ----------
     def reset(self, seed=None, options=None):
@@ -154,7 +156,24 @@ class MultiScaleDialEnv(gym.Env):
         self._ever_pos = False
         self._ever_dial = False
         self._make_background()
-        return self._obs(), {"state": self.get_state()}
+        # ojo: la clave del info es "agent_state" (crudo [p, θ]), NO "state":
+        # EverythingToInfoWrapper de swm sube obs→info y colisionaría con
+        # obs["state"] = [p, sin, cos] (spec §1). Las claves de step
+        # (success/ever/dpos/dth) van TAMBIÉN en el reset: EnvPool apila solo
+        # las claves presentes en el primer reset (_stack_fresh) y descarta
+        # las nuevas que aparezcan en step (_write_env_info).
+        return self._obs(), {
+            "agent_state": self.get_state(),
+            "success_pos": False,
+            "success_dial": False,
+            "ever_pos": False,
+            "ever_dial": False,
+            "dpos": None,
+            "dth_max": None,
+            # convención TwoRoom: la eval de swm usa esta clave para las
+            # trazas de distancia (si no, cae al fallback -reward = 0)
+            "distance_to_target": np.nan,
+        }
 
     def step(self, action):
         a = np.clip(np.asarray(action, np.float64), -1, 1)
@@ -178,13 +197,14 @@ class MultiScaleDialEnv(gym.Env):
             ok_p = ok_th = False
             terminated = False
         info = {
-            "state": self.get_state(),
+            "agent_state": self.get_state(),
             "success_pos": bool(ok_p),
             "success_dial": bool(ok_th),
             "ever_pos": bool(self._ever_pos),
             "ever_dial": bool(self._ever_dial),
             "dpos": dpos,
             "dth_max": dth_max,
+            "distance_to_target": np.nan if dpos is None else float(dpos),
         }
         return self._obs(), 0.0, terminated, trunc, info
 

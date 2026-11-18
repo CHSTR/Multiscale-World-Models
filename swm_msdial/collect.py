@@ -34,7 +34,7 @@ VAL_SEED_OFFSET = 10_000_000
 SCHEMA = {
     "pixels": np.uint8,
     "action": np.float32,
-    "state": np.float64,
+    "raw_state": np.float64,
     "observation": np.float64,
     "proprio": np.float64,
     "ep_idx": np.int32,
@@ -64,7 +64,7 @@ def _write_h5(path: Path, episodes, steps: int, levels, style, seed: int,
             elif col == "action":
                 ds[col] = f.create_dataset(col, (n, 2 + env.K), dtype=dt,
                                            chunks=(min(1000, n), 2 + env.K))
-            elif col in ("state",):
+            elif col in ("raw_state",):
                 ds[col] = f.create_dataset(col, (n, 2 + env.K), dtype=dt)
             elif col in ("observation", "proprio"):
                 ds[col] = f.create_dataset(col, (n, 2 + 2 * env.K), dtype=dt)
@@ -77,7 +77,7 @@ def _write_h5(path: Path, episodes, steps: int, levels, style, seed: int,
             if val:
                 ep_seed += VAL_SEED_OFFSET
             obs, info = env.reset(seed=ep_seed)
-            st = info["state"]
+            st = info["agent_state"]
             target = env.sample_state(rng)
             for t in range(steps):
                 if t % 25 == 0:
@@ -86,10 +86,10 @@ def _write_h5(path: Path, episodes, steps: int, levels, style, seed: int,
                     act = rng.uniform(-1, 1, env.action_space.shape).astype(np.float32)
                 else:
                     act = scripted_policy(st, target, rng)
-                obs_arr = np.asarray(obs["pixels"], dtype=np.uint8)
+                obs_arr = np.asarray(env.render(), dtype=np.uint8)
                 ds["pixels"][row] = obs_arr
                 ds["action"][row] = act
-                ds["state"][row] = st
+                ds["raw_state"][row] = st
                 obs_v = np.asarray(obs["state"], dtype=np.float64)
                 ds["observation"][row] = obs_v
                 ds["proprio"][row] = obs_v
@@ -99,7 +99,7 @@ def _write_h5(path: Path, episodes, steps: int, levels, style, seed: int,
                 ds["reward"][row] = 0.0
                 row += 1
                 obs, _, _, _, info = env.step(act)
-                st = info["state"]
+                st = info["agent_state"]
             ds["ep_len"][ep] = steps
             ds["ep_offset"][ep] = ep * steps
     return path

@@ -22,7 +22,7 @@ VAL = TMP / "msdial_val_k2_balanced.h5"
 SCHEMA = {
     "pixels": ((40, 224, 224, 3), "uint8"),
     "action": ((40, 3), "float32"),
-    "state": ((40, 3), "float64"),                # [p_x, p_y, θ] crudo
+    "raw_state": ((40, 3), "float64"),                # [p_x, p_y, θ] crudo
     "observation": ((40, 4), "float64"),           # [p, sinθ, cosθ]
     "proprio": ((40, 4), "float64"),
     "ep_idx": ((40,), "int32"),
@@ -88,10 +88,10 @@ def test_acciones_rango():
 
 def test_train_val_disjuntos():
     with h5py.File(TRAIN) as ft, h5py.File(VAL) as fv:
-        assert ft["state"].shape == (40, 3) and fv["state"].shape == (20, 3)
+        assert ft["raw_state"].shape == (40, 3) and fv["raw_state"].shape == (20, 3)
         # episodios de val: seeds con offset 10_000_000 -> estados distintos
-        st = ft["state"][()]
-        sv = fv["state"][()]
+        st = ft["raw_state"][()]
+        sv = fv["raw_state"][()]
         cen_t = st.reshape(4, 10, 3).mean(axis=1)
         cen_v = sv.reshape(2, 10, 3).mean(axis=1)
         for c in cen_v:

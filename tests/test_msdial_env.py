@@ -22,8 +22,9 @@ def test_register_and_make():
 
     env = gym.make("swm/MultiScaleDial-v0", levels=(2,), max_episode_steps=100)
     obs, info = env.reset(seed=0)
-    assert obs["pixels"].shape == (224, 224, 3)
-    assert isinstance(env.unwrapped, object)
+    assert obs["state"].shape == (4,)          # [p, sinθ, cosθ] con K=1 (levels=(2,))
+    assert env.render().shape == (224, 224, 3)  # pixels via render (wrapper)
+    assert "agent_state" in info
     env.close()
 
 
@@ -52,9 +53,13 @@ def test_step_terminates_only_with_goal(env2):
     goal = env2.sample_state(rng)
     env2._set_goal_state(goal)
     terminated = False
-    for _ in range(50):
+    for i in range(50):
         a = scripted_policy(env2.get_state(), goal, rng, noise=0.0)
-        _, _, term, _, _ = env2.step(a)
+        _, _, term, _, info = env2.step(a)
+        if i == 0:
+            # convención TwoRoom: distancia real en el info para las trazas
+            assert isinstance(info["distance_to_target"], float)
+            assert info["distance_to_target"] > 0
         terminated = terminated or term
     assert terminated is True
 
@@ -115,12 +120,12 @@ def test_oracle_reachability():
         res = []
         for i in range(20):
             _, info = env.reset(seed=i)
-            goal = env.sample_goal(info["state"], mode, rng)
+            goal = env.sample_goal(info["agent_state"], mode, rng)
             env._set_goal_state(goal)
-            st = info["state"]
+            st = info["agent_state"]
             for _ in range(50):
                 _, _, _, _, info = env.step(
                     scripted_policy(st, goal, rng, noise=0.0))
-                st = info["state"]
+                st = info["agent_state"]
             res.append(env.success(st, goal)["all"])
         assert np.mean(res) == 1.0, f"oracle falló en modo {mode}"

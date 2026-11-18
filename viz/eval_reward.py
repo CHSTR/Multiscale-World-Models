@@ -17,6 +17,8 @@ from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 from viz.eval_traces import evaluate_with_traces, save_traces, format_summary
 
+import swm_msdial  # noqa: F401  — registra swm/MultiScaleDial-v0 en gymnasium
+
 def img_transform(cfg):
     transform = transforms.Compose(
         [
@@ -155,9 +157,43 @@ def run(cfg: DictConfig):
     end_time = time.time()
 
     metrics = results["aggregate"]
+    per_episode = results["per_episode"]
+
+    # msdial: éxito por componente (spec §3) desde los flags ever_* del env
+    # (el env acumula OR por episodio; el pool congela el info de envs ya
+    # terminados, así que world.infos al final = éxito por episodio).
+    msdial = {}
+    n = world.num_envs
+    for key in ("ever_pos", "ever_dial"):
+        if key in world.infos:
+            arr = np.asarray(world.infos[key]).reshape(-1)[:n].astype(bool)
+            msdial[key] = arr
+            metrics[f"success_{key.split('_')[1]}"] = float(arr.mean() * 100.0)
+    for key in ("dpos", "dth_max"):
+        if key in world.infos:
+            msdial[key] = np.asarray(world.infos[key], dtype=float).reshape(-1)[:n]
+
     print(metrics)
 
     save_traces(results_path / "traces.npz", results)
+
+    if msdial:
+        import json
+        line = {
+            "policy": str(cfg.get("policy")),
+            "dataset_name": str(cfg.eval.dataset_name),
+            "seed": int(cfg.seed),
+            "levels": list(cfg.world.get("levels", [])),
+            "dial_style": str(cfg.world.get("dial_style")),
+            "successes": [bool(x) for x in per_episode["success"]],
+            "success_pos": [bool(x) for x in msdial["ever_pos"]],
+            "success_dial": [bool(x) for x in msdial["ever_dial"]],
+            "dpos": [float(x) for x in msdial.get("dpos", [])],
+            "dth_max": [float(x) for x in msdial.get("dth_max", [])],
+        }
+        with (results_path / "results.jsonl").open("a") as f:
+            f.write(json.dumps(line) + "\n")
+        print(f"results.jsonl -> {results_path / 'results.jsonl'}")
 
     results_path = results_path / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)

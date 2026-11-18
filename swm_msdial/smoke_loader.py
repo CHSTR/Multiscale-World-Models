@@ -25,7 +25,7 @@ def main():
 
     ds = swm.data.load_dataset(
         args.file,
-        keys_to_load=["pixels", "action", "state", "observation", "proprio"],
+        keys_to_load=["pixels", "action", "raw_state", "observation", "proprio"],
         keys_to_cache=["action"],
     )
     ep_len = int(np.asarray(ds.lengths).ravel()[0])
@@ -42,7 +42,7 @@ def main():
     assert row["pixels"].shape == (224, 224, 3), row["pixels"].shape
 
     dim = ds.get_dim("action")
-    state_dim = row["state"].shape[0] if "state" in row else None
+    state_dim = row["raw_state"].shape[0] if "raw_state" in row else None
     print(f"get_dim(action)={dim}  state_dim={state_dim}  chunk rows OK ({rows})")
     print("SMOKE OK")
 

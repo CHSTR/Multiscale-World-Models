@@ -17,8 +17,12 @@ from module import SIGReg, sigreg_input
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback, StarletVisCallback
 
 
-def lejepa_forward(self, batch, stage, cfg):
+def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state"):
     """encode observations, predict next states, compute losses."""
+
+    if pixels is not None:
+        # data.render.online=true: el batch trae estados crudos, no píxeles.
+        batch["pixels"] = pixels(batch[state_col])
 
     ctx_len = cfg.history_size
     n_preds = cfg.num_preds
@@ -108,23 +112,35 @@ def run(cfg):
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
-    transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
+
+    # data.render.online=true: el dataset no trae `pixels`; los frames se
+    # dibujan en el device con stable-envs a partir de la columna de estado.
+    render_cfg = cfg.data.get("render", None)
+    online = bool(render_cfg and render_cfg.get("online", False))
+    state_col = str(render_cfg.get("state_column", "state")) if online else "state"
+
+    transforms = [] if online else [
+        get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)
+    ]
     
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
                 continue
+            if online and col == state_col:
+                continue  # el renderer necesita el estado crudo, sin normalizar
             normalizer = get_column_normalizer(dataset, col, col)
             transforms.append(normalizer)
 
         cfg.model.action_encoder.input_dim = cfg.data.dataset.frameskip * dataset.get_dim("action")
 
-    transform = spt.data.transforms.Compose(*transforms)
-    dataset.transform = transform
+    if transforms:
+        transform = spt.data.transforms.Compose(*transforms)
+        dataset.transform = transform
 
     # Grab one sample frame for starlet visualization
     sample_frame = None
-    if cfg.model.encoder._target_ == "wavelet.starlet_encoder.StarletEncoder":
+    if not online and cfg.model.encoder._target_ == "wavelet.starlet_encoder.StarletEncoder":
         for i in range(min(100, len(dataset))):
             try:
                 row = dataset.get_row_data(i)
@@ -160,11 +176,20 @@ def run(cfg):
         },
     }
 
+    pixels = None
+    if online:
+        from online_render import Pixels
+        stats = spt.data.dataset_stats.ImageNet
+        pixels = Pixels(
+            OmegaConf.to_container(render_cfg.env, resolve=True),
+            cfg.img_size, stats["mean"], stats["std"],
+        )
+
     data_module = spt.data.DataModule(train=train, val=val)
     world_model = spt.Module(
         model = world_model,
         sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
-        forward=partial(lejepa_forward, cfg=cfg),
+        forward=partial(lejepa_forward, cfg=cfg, pixels=pixels, state_col=state_col),
         optim=optimizers,
     )
 
@@ -228,6 +253,8 @@ def run(cfg):
     )
 
     manager()
+    if pixels is not None:
+        pixels.close()
     return
 
 

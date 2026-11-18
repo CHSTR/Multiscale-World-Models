@@ -1,0 +1,38 @@
+# PushT con frames renderizados ONLINE por stable-envs.
+#
+# El dataset NO carga `pixels`: sólo estados + acción. En el forward, train.py
+# dibuja los frames en el device del batch (GPU) con `online_render.Pixels`.
+#
+# Requiere el venv con `stable-envs[pusht]` instalado (ver
+# /home/chr/stable-envs-test). Usar con modelos que consumen batch["pixels"],
+# p. ej. `model=convnext_ms` o `model=dinov3_convnext_tiny`.
+#
+# Run:
+#   python train.py data=pusht_online model=convnext_ms \
+#     output_model_name=cnms_pusht_online
+
+dataset:
+  num_steps: ${eval:'${num_preds} + ${history_size}'}
+  frameskip: 5
+  name: pusht_expert_train.h5
+  keys_to_load:
+    - action
+    - proprio
+    - state
+  keys_to_cache:
+    - action
+    - proprio
+    - state
+
+render:
+  online: true
+  state_column: state
+  # Mapeo estado -> State de stable-envs (ejemplo oficial de LeWM/PushT).
+  env:
+    id: PushT
+    kwargs: {}
+    leaves:
+      - {leaf: current.body.agent.position, columns: [0, 2]}
+      - {leaf: current.body.block.position, columns: [2, 4]}
+      - {leaf: current.body.block.angle, columns: [4, 5]}
+    zero: [current.render_segments, current.render_segment_count]

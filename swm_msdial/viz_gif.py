@@ -75,7 +75,9 @@ def main():
     tr = {k.replace("trace_", ""): v for k, v in np.load(run_dir / "traces.npz").items()}
     assert "pixels" in tr, "traces.npz no tiene trace_pixels: re-correr la eval"
     lines = [json.loads(l) for l in (run_dir / "results.jsonl").read_text().splitlines()]
-    res = lines[-1]
+    name = Path(a.eval).name
+    res = next(j for j in reversed(lines)
+               if Path(j["dataset_name"]).name == name)
     succ = np.asarray(res["successes"], bool)
 
     with h5py.File(DS / a.eval) as f:
@@ -97,7 +99,8 @@ def main():
     for tag, ep in picks[:2]:
         goal_xy = goal_xy_eps[ep]
         frames = frames_for_episode(tr, goal_px, goal_xy, ep, bool(succ[ep]))
-        path = out / f"{a.run}__ep{ep}_{tag}.gif"
+        mode = Path(a.eval).stem.split("_")[-1]
+        path = out / f"{a.run}__{mode}__ep{ep}_{tag}.gif"
         imageio.mimsave(path, frames, duration=1 / a.fps, loop=0)
         print(f"[{tag}] ep {ep} -> {path} ({len(frames)} frames)")
 

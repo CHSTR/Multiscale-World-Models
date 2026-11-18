@@ -181,7 +181,9 @@ def evaluate_with_traces(
         tr_reward.append(np.asarray(w.rewards, dtype=float).copy())
         # Píxeles por paso (diezmados a 112×112 para no inflar el .npz).
         px = np.asarray(w.infos.get("pixels"))
-        if px.ndim == 4:
+        if px.ndim == 5:          # (n, time=1, H, W, C) — infos de swm
+            px = px[:, -1]
+        if px.ndim == 4:          # (n, H, W, C)
             tr_pixels.append(px[:, ::2, ::2].astype(np.uint8).copy())
 
     world._run(max_steps=eval_budget, mode="wait", on_step=on_step)

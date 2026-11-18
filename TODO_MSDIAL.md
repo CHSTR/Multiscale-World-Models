@@ -15,6 +15,21 @@ Actualizado: 2026-11-18 ~16:40 (hora local)
 - [x] Disco resuelto: `datasets/msdial` movido a `/run/media/chr/phd/Multiescale_bkup/msdial` (1.3 TB libres) vía symlink
 - [x] Suite: **85 tests verdes**; rama `msdial` con commits T1–T6 + extensión de matriz
 
+## PAUSADO (19:00, a pedido del usuario)
+
+Todo detenido: 0 procesos, GPU libre. El barrido se cortó tras el primer run
+completo (`lewm` k=2). El `starlet` k=2 terminó y guardó checkpoint (sin eval).
+
+Resultados disponibles:
+- **Piloto k=1** (`lewm`, 2 ep): coarse pos **2%**, fine dial **30%**, both 0% · sonda R² **−0.79**.
+- **k=2** (`lewm`, 2 ep, fine 30 eps): dial **100%**, both **53.3%** ← el dial se resuelve a 2 epochs en k=2.
+- Evals k=1 ×3 modos (50 eps) + k=2 lewm fine (30 eps); `reports/probe_k1_lewm_s0.json`.
+- Checkpoints: `msdial_k1_balanced__lewm__s0`, `msdial_k2_balanced__lewm__s0`, `msdial_k2_balanced__starlet__s0`.
+- Datasets k1/k2/k3 + eval sets íntegros (locales, 50 GB) — listos para retomar.
+
+Pregunta abierta al retomar: k=1 vs k=2 (¿dificultad real del anillo grande o run atípico?)
+y presupuesto de epochs para el control de posición.
+
 ## En curso (background)
 
 - [x] ~~k=1 primera recolección~~ → **matada por timeout de 1 h** (16:31). La cadena del piloto lanzó un `mv` en plena escritura de k2/k3: detenido a tiempo, copia parcial borrada, fuentes intactas.

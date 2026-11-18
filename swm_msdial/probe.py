@@ -73,6 +73,7 @@ def probe_checkpoint(policy_path: str, data_path: str,
                      val_frac: float = 0.2, max_frames: int = 20000,
                      batch: int = 64, seed: int = 0) -> dict:
     import h5py
+    import hdf5plugin  # noqa: F401 — registra blosc para leer los frames
 
     with h5py.File(data_path) as f:
         n = min(len(f["ep_idx"]), max_frames)

@@ -35,9 +35,20 @@ def test_cli_emit(tmp_path):
     out = tmp_path / "run_E1.sh"
     r = subprocess.run(
         [sys.executable, str(REPO / "experiments" / "matrix_msdial.py"),
-         "--emit", str(out)],
+         "--emit", str(out), "--groups", "all"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-1000:]
     text = out.read_text()
-    assert text.count("train.py") == 84
+    # scratch (7) + pretrained (7) = 14 arms x 4 datasets x 3 seeds
+    assert text.count("train.py") == 168
     assert "#!/bin/bash" in text
+    assert "dinov2_lora" in text and "dinov3_convnext_base" in text
+
+
+def test_groups_scratch_vs_pretrained():
+    from experiments.matrix_msdial import GROUPS
+
+    assert len(GROUPS["scratch"]) == 7
+    assert len(GROUPS["pretrained"]) == 7
+    assert len(GROUPS["all"]) == 14
+    assert set(GROUPS["scratch"]) & set(GROUPS["pretrained"]) == set()

@@ -27,6 +27,21 @@ ARMS = [
     "convnext_ms",   # multiescala jerárquica nativa (sin wavelets)
 ]
 
+# Track preentrenado (spec §4: se interpreta aparte). Mismo presupuesto por
+# arm; DINO ± front-end multiescala y ConvNeXt preentrenado (jerarquía nativa).
+PRETRAINED_ARMS = [
+    "dinov2_lora",          # DINOv2-S + LoRA
+    "dinov2_starlet_lora",  # DINOv2-S + LoRA + starlet
+    "dinov3_lora",          # DINOv3-S + LoRA
+    "dinov3_starlet_lora",  # DINOv3-S + LoRA + starlet
+    "dinov3_convnext_tiny",
+    "dinov3_convnext_small",
+    "dinov3_convnext_base",
+]
+
+GROUPS = {"scratch": ARMS, "pretrained": PRETRAINED_ARMS,
+          "all": ARMS + PRETRAINED_ARMS}
+
 DATASETS_E1 = [
     ("k1", "balanced"),
     ("k2", "balanced"),
@@ -88,10 +103,14 @@ def to_bash(cmds: list[str]) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--emit", default="run_E1.sh")
-    ap.add_argument("--arms", nargs="+", default=ARMS)
+    ap.add_argument("--groups", default="scratch",
+                    choices=sorted(GROUPS))
+    ap.add_argument("--arms", nargs="+", default=None,
+                    help="override de brazos (default: --groups)")
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     a = ap.parse_args()
-    cmds = emit(arms=a.arms, seeds=tuple(a.seeds))
+    arms = a.arms if a.arms is not None else GROUPS[a.groups]
+    cmds = emit(arms=arms, seeds=tuple(a.seeds))
     out = Path(a.emit)
     out.write_text(to_bash(cmds))
     n_train = sum(1 for c in cmds if "train.py" in c)

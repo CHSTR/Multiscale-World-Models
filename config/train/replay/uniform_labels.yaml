@@ -1,0 +1,12 @@
+# @package _global_
+#
+# Control "0": muestreo uniforme (sobre ventanas válidas), mismas ventanas de
+# history_size + K frames, mismas etiquetas y misma H pasiva. Aísla el efecto del
+# sampler: compárese per_is / per_focal / per_shuffled contra ESTE run, no contra
+# el baseline sin replay (que usa ventanas de 4 frames e incluye las de borde).
+defaults:
+  - base
+  - _self_
+
+replay:
+  sampler: uniform

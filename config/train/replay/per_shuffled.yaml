@@ -1,0 +1,13 @@
+# @package _global_
+#
+# Control de prioridades barajadas: misma distribución de prioridades que per_is,
+# pero permutada entre índices (desacoplada del contenido). Separa "enfocarse en
+# la sorpresa" de "muestrear de forma no uniforme".
+defaults:
+  - base
+  - _self_
+
+replay:
+  sampler: shuffled
+  beta_start: 0.4
+  beta_end: 1.0

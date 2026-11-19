@@ -1,0 +1,14 @@
+# @package _global_
+#
+# Run B: reponderación focal. Sin IS en pred_loss (beta = 0): el objetivo se
+# desplaza a propósito hacia las transiciones difíciles. SIGReg sigue con ECF
+# ponderada (beta = 1). Pregunta: ¿cambiar el objetivo hacia lo difícil mejora
+# la planificación?
+defaults:
+  - base
+  - _self_
+
+replay:
+  sampler: prioritized
+  beta_start: 0.0
+  beta_end: 0.0

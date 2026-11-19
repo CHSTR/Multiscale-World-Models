@@ -1,0 +1,43 @@
+# @package _global_
+#
+# Base común del replay priorizado + red de alucinación H (F1). No se usa sola:
+# la heredan los presets (uniform_labels, per_is, per_focal, per_shuffled).
+#
+# Sólo JEPA global (emb (B, T, D)), p. ej. model=dinov3_lora.
+#
+# Cada ventana trae history_size + horizon frames (num_steps se sobrescribe aquí):
+# pred_loss y SIGReg usan los primeros history_size + num_preds, como el baseline;
+# el resto alimenta las etiquetas e_1..e_K del rollout (mismo procedimiento que
+# JEPA.rollout / CEM). Costo extra por paso: encoder sin gradiente sobre
+# (horizon - num_preds) frames + K forwards del predictor.
+replay:
+  enabled: true
+  sampler: prioritized       # uniform | prioritized | shuffled (control)
+  priority: error            # error | surprise | progress
+  horizon: 5                 # K = horizonte del planificador (config/eval/*: horizon 5)
+  alpha: 0.6                 # P(i) ∝ p_i^alpha
+  beta_start: 0.4            # IS de pred_loss (0 -> focal, sin corrección)
+  beta_end: 1.0
+  beta_anneal_frac: 1.0      # fracción del entrenamiento para anillar beta
+  eps_uniform: 0.1           # mezcla uniforme: toda ventana válida tiene P >= eps/N
+  clip_quantile: 0.99        # recorte de prioridades; no visitadas reciben este valor
+  warmup_epochs: 1.0         # muestreo uniforme al inicio (el buffer se llena igual)
+  ema_decay: 0.99            # media móvil del error por horizonte (normalización)
+  chunk_batches: 32          # cada cuántos batches recalcula P el sampler
+  log_every: 50
+  dump_topk: 16              # CSV + PNG de las ventanas con mayor prioridad por época
+  seed: ${seed}
+  hnet:
+    enabled: true            # F1: H pasiva (se entrena y se mide, no decide nada)
+    input: state_action      # state | state_action | state_action_pred
+    hidden: 512
+    depth: 2
+    lr: 1e-3
+    weight_decay: 1e-4
+    rank_weight: 1.0
+    rank_margin: 0.05
+    huber_delta: 1.0
+
+data:
+  dataset:
+    num_steps: ${eval:'${history_size} + ${replay.horizon}'}

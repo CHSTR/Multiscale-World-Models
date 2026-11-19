@@ -22,16 +22,26 @@ class SIGReg(torch.nn.Module):
         self.register_buffer("phi", window)
         self.register_buffer("weights", weights * window)
 
-    def forward(self, proj):
+    def forward(self, proj, weights=None):
         """
         proj: (T, B, D)
+        weights: (B,) opcional. Pesos por muestra (p. ej. IS del replay
+            priorizado): la función característica empírica pasa a ser una media
+            ponderada autonormalizada, así que el estadístico mide la isotropía
+            bajo la distribución de los datos aunque el batch venga sesgado.
+            ``None`` = comportamiento original.
         """
         # sample random projections
         A = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
         A = A.div_(A.norm(p=2, dim=0))
         # compute the epps-pulley statistic
         x_t = (proj @ A).unsqueeze(-1) * self.t
-        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
+        if weights is None:
+            err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
+        else:
+            w = weights.to(device=x_t.device, dtype=torch.float32)
+            w = (w / w.sum()).to(x_t.dtype).view(1, -1, 1, 1)
+            err = ((x_t.cos() * w).sum(-3) - self.phi).square() + (x_t.sin() * w).sum(-3).square()
         statistic = (err @ self.weights) * proj.size(-2)
         return statistic.mean() # average over projections and time
     

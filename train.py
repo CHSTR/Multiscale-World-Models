@@ -14,11 +14,20 @@ from omegaconf import OmegaConf, open_dict
 from jepa_spatial import spatial_losses
 from jepa_pyramid import pyramid_losses
 from module import SIGReg, sigreg_input
+from prioritized_replay import (replay_collect, replay_weights, split_time, valid_windows,
+                                weighted_mean)
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback, StarletVisCallback
 
 
-def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state"):
-    """encode observations, predict next states, compute losses."""
+def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state", replay=None):
+    """encode observations, predict next states, compute losses.
+
+    ``replay`` (``prioritized_replay.ReplayState``, opcional): replay priorizado +
+    etiquetas de K horizontes para la red de alucinación H. La ventana trae
+    ``history_size + K`` frames, pero pred_loss y SIGReg usan sólo los primeros
+    ``history_size + num_preds`` (mismo cálculo que el baseline); con
+    ``replay=None`` el forward es exactamente el original.
+    """
 
     if pixels is not None:
         # data.render.online=true: el batch trae estados crudos, no píxeles.
@@ -28,8 +37,18 @@ def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state"):
     n_preds = cfg.num_preds
     lambd = cfg.loss.sigreg.weight
 
+    full_batch = None
+    if replay is not None:
+        # Antes de nan_to_num: ventanas que cruzan un borde de secuencia en alguna
+        # acción usada por el rollout de etiquetado (posiciones < HS + K - 1).
+        valid = valid_windows(batch["action"], ctx_len + replay.cfg.horizon - 1)
+
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+
+    if replay is not None:
+        full_batch = batch
+        batch = split_time(full_batch, ctx_len + n_preds)
 
     output = self.model.encode(batch)
 
@@ -38,6 +57,12 @@ def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state"):
 
     ctx_act = act_emb[:, : ctx_len]
     extra_logs = {}
+
+    if replay is not None and (isinstance(emb, dict) or emb.ndim != 3):
+        raise NotImplementedError(
+            "replay priorizado (F1) sólo está implementado para el JEPA global "
+            "(emb (B, T, D), p. ej. model=dinov3_lora); usa replay=disabled con este modelo."
+        )
 
     if isinstance(emb, dict):
         # LiftWM: latentes por escala. pred_loss = media ponderada por scale_weights;
@@ -73,16 +98,32 @@ def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state"):
         pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
 
         # LeWM loss
-        output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+        w_pred = w_sig = None
+        if replay is not None:
+            # Pesos IS: w_pred con beta (0 = focal, sin corrección); SIGReg siempre
+            # con beta=1 (ECF ponderada) -> isotropía bajo la distribución real.
+            w_pred, w_sig = replay_weights(full_batch, replay, stage)
+        if w_pred is None:
+            output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+        else:
+            per_sample = (pred_emb - tgt_emb).float().pow(2).mean(dim=(1, 2))   # (B,)
+            output["pred_loss"] = weighted_mean(per_sample, w_pred)
         if lambd > 0:
-            output["sigreg_loss"] = self.sigreg(
-                sigreg_input(emb, cfg.loss.sigreg.get("max_tokens", None))
-            )
+            sig_in = sigreg_input(emb, cfg.loss.sigreg.get("max_tokens", None))
+            output["sigreg_loss"] = (self.sigreg(sig_in) if w_sig is None
+                                     else self.sigreg(sig_in, weights=w_sig))
         else:
             # Sin parámetros entrenables antes de emb (encoder congelado y sin
             # projector) SIGReg tiene gradiente cero: no se calcula.
             output["sigreg_loss"] = pred_emb.new_zeros((), dtype=torch.float32)
         output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+
+        if replay is not None:
+            # Etiquetas de K horizontes (sin gradiente) -> replay.last (lo lee el callback).
+            extra_logs.update(replay_collect(
+                self.model, full_batch, emb, act_emb, valid, replay,
+                history_size=ctx_len, t_main=ctx_len + n_preds, stage=stage,
+            ))
 
         # JEPA espacial (emb (B,T,N,D)): gate L1, dinámica inversa, rollout y diagnóstico.
         if emb.ndim == 4:
@@ -158,9 +199,30 @@ def run(cfg):
         dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
     )
 
-    train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
+    # Replay priorizado (replay=per_is|per_focal|per_shuffled|uniform_labels): el
+    # sampler vive en el proceso principal y entrega claves (idx, P_idx); los
+    # datasets se envuelven para que cada ventana traiga su idx y su probabilidad.
+    replay_state = None
+    replay_cfg = cfg.get("replay", None)
+    if replay_cfg is not None and replay_cfg.get("enabled", False):
+        from prioritized_replay import (IndexedDataset, PrioritizedSampler, ReplayConfig,
+                                        ReplayState)
+        rcfg = ReplayConfig.from_cfg(replay_cfg)
+        train_set, val_set = IndexedDataset(train_set), IndexedDataset(val_set)
+        replay_state = ReplayState(rcfg, n=len(train_set))
+        sampler = PrioritizedSampler(
+            replay_state, num_samples=len(train_set), batch_size=cfg.loader.batch_size,
+            generator=torch.Generator().manual_seed(cfg.seed + 1),
+        )
+        train = torch.utils.data.DataLoader(train_set, **cfg.loader, sampler=sampler, drop_last=True)
+        print(f"[replay] sampler={rcfg.sampler} priority={rcfg.priority} K={rcfg.horizon} "
+              f"alpha={rcfg.alpha} beta={rcfg.beta_start}->{rcfg.beta_end} eps={rcfg.eps_uniform} "
+              f"warmup_steps={sampler.warmup_steps} hnet={rcfg.hnet_enabled}({rcfg.hnet_input}) "
+              f"N_train={len(train_set)}")
+    else:
+        train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
     val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
-    
+
     ##############################
     ##       model / optim      ##
     ##############################
@@ -189,7 +251,8 @@ def run(cfg):
     world_model = spt.Module(
         model = world_model,
         sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
-        forward=partial(lejepa_forward, cfg=cfg, pixels=pixels, state_col=state_col),
+        forward=partial(lejepa_forward, cfg=cfg, pixels=pixels, state_col=state_col,
+                        replay=replay_state),
         optim=optimizers,
     )
 
@@ -219,6 +282,15 @@ def run(cfg):
             run_dir=run_dir,
             sample_frame=sample_frame,
             levels=cfg.model.encoder.get("levels", 4),
+        ))
+    if replay_state is not None:
+        # Buffer + H (pasiva) + diagnósticos en <run_dir>/replay/ (H con su propio
+        # optimizador: no comparte gradiente, clipping ni scheduler con el WM).
+        from prioritized_replay import PrioritizedReplayCallback
+        callbacks.append(PrioritizedReplayCallback(
+            replay_state, train_dataset=train_set, run_dir=run_dir,
+            z_dim=cfg.embed_dim, a_dim=cfg.model.action_encoder.emb_dim,
+            history_size=cfg.history_size,
         ))
 
     trainer = pl.Trainer(

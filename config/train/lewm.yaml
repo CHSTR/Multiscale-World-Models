@@ -3,6 +3,9 @@ defaults:
   - launcher: local
   - data: pusht
   - model: lewm
+  # Replay priorizado + red de alucinación H (docs/replay_hnet.md):
+  #   replay=uniform_labels | per_is | per_focal | per_shuffled
+  - replay: disabled
 
 output_model_name: lewm
 subdir: ${hydra:job.id}

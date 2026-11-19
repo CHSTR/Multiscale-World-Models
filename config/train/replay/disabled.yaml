@@ -1,0 +1,2 @@
+# Replay priorizado desactivado: DataLoader con shuffle uniforme y forward original.
+enabled: false

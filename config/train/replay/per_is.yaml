@@ -1,0 +1,13 @@
+# @package _global_
+#
+# Run A: PER "insesgado". IS en pred_loss con beta 0.4 -> 1 (Schaul et al.) y
+# SIGReg con ECF ponderada (beta = 1). Pregunta: ¿priorizar acelera/mejora el
+# MISMO objetivo?
+defaults:
+  - base
+  - _self_
+
+replay:
+  sampler: prioritized
+  beta_start: 0.4
+  beta_end: 1.0

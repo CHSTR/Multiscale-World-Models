@@ -139,6 +139,12 @@ def rcfg(**kw):
 # ---------------------------------------------------------------------- #
 def test_config_from_hydra_presets():
     from hydra import compose, initialize_config_dir
+    # stable_pretraining registra el resolver `eval` al importarse; hacerlo acá
+    # primero evita el ValueError por doble registro cuando otro test lo importa.
+    try:
+        import stable_pretraining  # noqa: F401
+    except Exception:
+        pass
     if not OmegaConf.has_resolver("eval"):
         OmegaConf.register_new_resolver("eval", eval)
     with initialize_config_dir(config_dir=os.path.abspath("config/train"), version_base=None):

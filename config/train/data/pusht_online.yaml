@@ -3,13 +3,15 @@
 # El dataset NO carga `pixels`: sólo estados + acción. En el forward, train.py
 # dibuja los frames en el device del batch (GPU) con `online_render.Pixels`.
 #
-# Requiere el venv con `stable-envs[pusht]` instalado (ver
-# /home/chr/stable-envs-test). Usar con modelos que consumen batch["pixels"],
-# p. ej. `model=convnext_ms` o `model=dinov3_convnext_tiny`.
+# Requiere `stable-envs[pusht]` instalado (sin rutas locales hardcodeadas).
+# Funciona tanto con `pusht_expert_train.h5` como con un archivo liviano sólo de
+# estados (`data.dataset.name=pusht_state.h5`, ~159 MB; ver scripts/make_states_only_h5.py).
+# Usar con modelos que consumen batch["pixels"], p. ej. `model=lewm`,
+# `model=dinov3_lora` o `model=convnext_ms`.
 #
 # Run:
-#   python train.py data=pusht_online model=convnext_ms \
-#     output_model_name=cnms_pusht_online
+#   python train.py data=pusht_online model=convnext_ms +experiment=slow_svreg \
+#     output_model_name=cnms_pusht_online_slow_svreg
 
 dataset:
   num_steps: ${eval:'${num_preds} + ${history_size}'}

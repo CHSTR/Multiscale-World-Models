@@ -1,0 +1,32 @@
+# TwoRoom con frames renderizados ONLINE por stable-envs.
+#
+# El dataset NO carga `pixels`: sólo estados (`proprio` = posición del agente) + acción.
+# En el forward, train.py dibuja los frames en el device del batch (GPU) con
+# `online_render.Pixels`.
+#
+# Requiere `stable-envs[navigation]` instalado.
+#
+# Run:
+#   python train.py data=tworoom_online model=lewm +experiment=slow_svreg \
+#     output_model_name=lewm_tworoom_online_slow_svreg
+
+dataset:
+  num_steps: ${eval:'${num_preds} + ${history_size}'}
+  frameskip: 5
+  name: tworoom_state.h5
+  keys_to_load:
+    - action
+    - proprio
+  keys_to_cache:
+    - action
+    - proprio
+
+render:
+  online: true
+  state_column: proprio
+  env:
+    id: TwoRoom
+    kwargs: {}
+    leaves:
+      - {leaf: agent/position, columns: [0, 2]}
+    zero: []

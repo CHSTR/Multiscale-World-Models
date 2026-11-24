@@ -51,7 +51,12 @@ class PyramidJEPA(JEPA):
         return rearrange(y, "(b t n) d -> b t n d", b=b, t=t, n=n)
 
     def _proj(self, module_dict, level, x):
-        return self._tokenwise(module_dict[str(level)], x)
+        if module_dict is None or isinstance(module_dict, nn.Identity):
+            return x
+        mod = module_dict[str(level)]
+        if isinstance(mod, nn.Identity):
+            return x
+        return self._tokenwise(mod, x)
 
     def encode(self, info):
         pixels = info["pixels"].float()
@@ -75,10 +80,13 @@ class PyramidJEPA(JEPA):
 
     def predict_rollout(self, emb_ctx, act_emb_seq, persist_hidden: bool = True,
                         detach_between: bool = False, history: Optional[int] = None):
-        post = {
-            l: (lambda y, l=l: self._proj(self.pred_proj, l, y.unsqueeze(1)).squeeze(1))
-            for l in emb_ctx
-        }
+        if self.pred_proj is None or isinstance(self.pred_proj, nn.Identity):
+            post = None
+        else:
+            post = {
+                l: (lambda y, l=l: self._proj(self.pred_proj, l, y.unsqueeze(1)).squeeze(1))
+                for l in emb_ctx
+            }
         return self.predictor.rollout(
             emb_ctx, act_emb_seq, grid_hw=self.grid_hw, post=post,
             persist_hidden=persist_hidden, detach_between=detach_between, history=history,

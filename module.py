@@ -44,6 +44,124 @@ class SIGReg(torch.nn.Module):
             err = ((x_t.cos() * w).sum(-3) - self.phi).square() + (x_t.sin() * w).sum(-3).square()
         statistic = (err @ self.weights) * proj.size(-2)
         return statistic.mean() # average over projections and time
+
+
+class SVReg(nn.Module):
+    """Sliced Variance Regularization (unilateral std >= 1 floor over S^{D-1})."""
+
+    def __init__(self, num_proj: int = 1024, eps: float = 1e-8, pooled: bool = False):
+        super().__init__()
+        self.num_proj = int(num_proj)
+        self.eps = float(eps)
+        self.pooled = bool(pooled)
+
+    def forward(self, proj: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        proj: (T, N, D) (or (N, D) treated as T=1)
+        weights: optional (N,) importance-sampling weights along the sample axis.
+        """
+        if proj.ndim == 2:
+            proj = proj.unsqueeze(0)
+        if proj.ndim != 3:
+            raise ValueError(f"SVReg expects 2D or 3D tensor, got shape {tuple(proj.shape)}")
+        T, N, D = proj.shape
+        if proj.numel() == 0 or T == 0 or N == 0:
+            return proj.new_zeros((), dtype=torch.float32)
+
+        with torch.autocast(device_type=proj.device.type, enabled=False):
+            x = proj.float()
+            w_norm = None
+            if weights is not None:
+                if weights.ndim != 1 or weights.numel() != N:
+                    raise ValueError(
+                        f"SVReg weights must have shape ({N},), got {tuple(weights.shape)}"
+                    )
+                w = weights.to(device=x.device, dtype=torch.float32).clamp_min(0.0)
+                w_sum = w.sum()
+                w_norm = torch.where(
+                    w_sum > 0,
+                    w / w_sum.clamp_min(1e-12),
+                    torch.full_like(w, 1.0 / max(1, N)),
+                )
+
+            if self.pooled:
+                x = x.reshape(1, T * N, D)
+                if w_norm is not None:
+                    w_norm = (w_norm.unsqueeze(0).expand(T, N) / float(T)).reshape(-1)
+
+            A = torch.randn(D, self.num_proj, device=x.device, dtype=torch.float32)
+            A = A / A.norm(p=2, dim=0, keepdim=True).clamp_min(1e-12)
+            p = x @ A  # (T', N', num_proj)
+
+            if w_norm is None:
+                mean = p.mean(dim=-2, keepdim=True)
+                var = (p - mean).square().mean(dim=-2)
+            else:
+                w_view = w_norm.view(1, -1, 1)
+                mean = (p * w_view).sum(dim=-2, keepdim=True)
+                var = ((p - mean).square() * w_view).sum(dim=-2)
+
+            std = torch.sqrt(var.clamp_min(0.0) + self.eps)
+            return F.relu(1.0 - std).square().mean()
+
+
+class SlownessLoss(nn.Module):
+    """Variance-normalized temporal slowness on the last 1/8 of latent dimensions."""
+
+    def __init__(self, slow_frac: float = 0.125, eps: float = 1e-6):
+        super().__init__()
+        self.slow_frac = float(slow_frac)
+        self.eps = float(eps)
+
+    def forward(self, emb: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        emb: (B, T, D) or (B, T, N, D)
+        weights: optional (B,) importance-sampling weights along the batch axis.
+        """
+        if emb.ndim not in (3, 4):
+            raise ValueError(f"SlownessLoss expects 3D or 4D tensor, got shape {tuple(emb.shape)}")
+        if emb.numel() == 0 or emb.size(0) == 0 or emb.size(1) < 2:
+            return emb.new_zeros((), dtype=torch.float32)
+        if emb.ndim == 4 and emb.size(2) == 0:
+            return emb.new_zeros((), dtype=torch.float32)
+
+        B, T = emb.shape[0], emb.shape[1]
+        D = emb.shape[-1]
+        d_slow = max(1, int(D * self.slow_frac))
+
+        with torch.autocast(device_type=emb.device.type, enabled=False):
+            b = emb[..., -d_slow:].float()
+            if weights is not None:
+                if weights.ndim != 1 or weights.numel() != B:
+                    raise ValueError(
+                        f"SlownessLoss weights must have shape ({B},), got {tuple(weights.shape)}"
+                    )
+                w = weights.to(device=b.device, dtype=torch.float32).clamp_min(0.0)
+                w_sum = w.sum()
+                w_norm = torch.where(
+                    w_sum > 0,
+                    w / w_sum.clamp_min(1e-12),
+                    torch.full_like(w, 1.0 / max(1, B)),
+                )
+                if b.ndim == 3:
+                    diff_sq = (b[:, 1:] - b[:, :-1]).square().sum(dim=-1).mean(dim=1)
+                    num = (w_norm * diff_sq).sum()
+                    w_bt = w_norm.view(B, 1, 1) / float(T)
+                    mu = (w_bt * b).sum(dim=(0, 1), keepdim=True)
+                    tr_var = (w_bt * (b - mu).square()).sum()
+                else:
+                    N = b.shape[2]
+                    diff_sq = (b[:, 1:] - b[:, :-1]).square().sum(dim=-1).mean(dim=(1, 2))
+                    num = (w_norm * diff_sq).sum()
+                    w_btn = w_norm.view(B, 1, 1, 1) / float(T * N)
+                    mu = (w_btn * b).sum(dim=(0, 1, 2), keepdim=True)
+                    tr_var = (w_btn * (b - mu).square()).sum()
+            else:
+                num = (b[:, 1:] - b[:, :-1]).square().sum(dim=-1).mean()
+                tr_var = b.reshape(-1, d_slow).var(dim=0, unbiased=False).sum()
+
+            denom = (2.0 * tr_var).clamp_min(self.eps)
+            return num / denom
     
 def sigreg_input(emb, max_tokens=None):
     """Prepara el input de SIGReg, ``(T, n_samples, D)``.
@@ -245,6 +363,25 @@ class Embedder(nn.Module):
         return x
 
 
+class GroupNorm1d(nn.GroupNorm):
+    """GroupNorm adapter accepting (num_channels, num_groups=8, ...) for MLP & Hydra _partial_."""
+
+    def __init__(
+        self,
+        num_channels: int,
+        num_groups: int = 8,
+        eps: float = 1e-5,
+        affine: bool = True,
+    ):
+        super().__init__(num_groups=num_groups, num_channels=num_channels, eps=eps, affine=affine)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim <= 2:
+            return super().forward(x)
+        lead = x.shape[:-1]
+        return super().forward(x.reshape(-1, x.shape[-1])).reshape(*lead, -1)
+
+
 class MLP(nn.Module):
     """Simple MLP with optional normalization and activation"""
 
@@ -267,9 +404,12 @@ class MLP(nn.Module):
 
     def forward(self, x):
         """
-        x: (B*T, D)
+        x: (..., D)
         """
-        return self.net(x)
+        if x.ndim <= 2:
+            return self.net(x)
+        lead = x.shape[:-1]
+        return self.net(x.reshape(-1, x.shape[-1])).reshape(*lead, -1)
 
 
 class ARPredictor(nn.Module):
@@ -288,14 +428,25 @@ class ARPredictor(nn.Module):
         dim_head=64,
         dropout=0.0,
         emb_dropout=0.0,
+        gated_residual: bool = False,
+        gate_init: float = 0.1,
     ):
         super().__init__()
+        out_dim = output_dim or input_dim
+        self.gated_residual = bool(gated_residual)
+        if self.gated_residual:
+            if out_dim != input_dim:
+                raise ValueError(
+                    f"ARPredictor gated_residual requires output_dim ({out_dim}) == input_dim ({input_dim})"
+                )
+            self.res_gate = nn.Parameter(torch.full((out_dim,), float(gate_init)))
+
         self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(
             input_dim,
             hidden_dim,
-            output_dim or input_dim,
+            out_dim,
             depth,
             heads,
             dim_head,
@@ -309,11 +460,14 @@ class ARPredictor(nn.Module):
         x: (B, T, d)
         c: (B, T, act_dim)
         """
+        x_in = x
         T = x.size(1)
         x = x + self.pos_embedding[:, :T]
         x = self.dropout(x)
-        x = self.transformer(x, c)
-        return x
+        out = self.transformer(x, c)
+        if self.gated_residual:
+            return x_in + self.res_gate * out
+        return out
 
 # Version adaptada para JEPA
 # Se utilizó como referencia y se reutilizaron cosas de: https://github.com/zhechencai/WaveViT/blob/main/classification/wavevit.py#L159

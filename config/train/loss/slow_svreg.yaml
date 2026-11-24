@@ -1,0 +1,25 @@
+type: slow_svreg
+svreg:
+  weight: 30.0
+  max_tokens: ${loader.batch_size}
+  kwargs:
+    num_proj: 1024
+    eps: 1e-8
+    pooled: false
+slow:
+  enabled: true
+  weight: null          # null -> 1.0 / svreg.weight (si svreg.weight > 0)
+  kwargs:
+    slow_frac: 0.125
+    eps: 1e-6
+# Mantener sigreg / gate_l1 / idm para compatibilidad con auxiliares y overrides
+sigreg:
+  weight: 0.0
+  max_tokens: ${loader.batch_size}
+  kwargs:
+    knots: 17
+    num_proj: 1024
+gate_l1:
+  weight: 0.0
+idm:
+  weight: 1.0

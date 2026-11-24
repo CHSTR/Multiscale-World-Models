@@ -16,10 +16,15 @@ from wavelet.hier_predictor import HierarchicalPredictor
 
 
 def scale_mlp_dict(n_scales: int, input_dim: int, output_dim: int,
-                   hidden_dim: int) -> nn.ModuleDict:
+                   hidden_dim: int, norm_fn=None, act_fn=None) -> nn.ModuleDict:
     from module import MLP
+    mlp_kwargs = {}
+    if norm_fn is not None:
+        mlp_kwargs["norm_fn"] = norm_fn
+    if act_fn is not None:
+        mlp_kwargs["act_fn"] = act_fn
     return nn.ModuleDict({
-        str(l): MLP(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
+        str(l): MLP(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim, **mlp_kwargs)
         for l in range(n_scales)
     })
 

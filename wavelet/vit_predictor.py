@@ -89,6 +89,8 @@ class ViTSpatialPredictor(nn.Module):
         dropout: float = 0.0,
         use_velocity: bool = True,
         max_tokens: int = 4096,
+        gated_residual: bool = False,
+        gate_init: float = 0.1,
         **_unused,  # tolera kwargs de config del NCA (steps, fire_rate, ...)
     ):
         super().__init__()
@@ -97,6 +99,9 @@ class ViTSpatialPredictor(nn.Module):
         self.depth = depth
         self.use_velocity = use_velocity
         self.max_tokens = int(max_tokens)
+        self.gated_residual = bool(gated_residual)
+        if self.gated_residual:
+            self.res_gate = nn.Parameter(torch.full((latent_dim,), float(gate_init)))
 
         dim = heads * dim_head
         self.dim = dim
@@ -155,7 +160,10 @@ class ViTSpatialPredictor(nn.Module):
         cond = self.act_proj(c)[:, None]  # (n, 1, dim), broadcast sobre N
         for blk in self.blocks:
             h = blk(h, cond)
-        return self.output_proj(self.norm(h))
+        out = self.output_proj(self.norm(h))
+        if self.gated_residual:
+            return x_cur + self.res_gate * out
+        return out
 
     # ------------------------------------------------------------------ #
     # Forward (teacher forcing)

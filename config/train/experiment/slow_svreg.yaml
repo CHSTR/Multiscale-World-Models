@@ -1,0 +1,23 @@
+# @package _global_
+# Slow SVReg configurable recipe ("The Content-Geometry Tradeoff in World Models"):
+#   - SVReg unilateral variance floor (default lambda=30.0)
+#   - Slowness penalty on last 1/8 latent dims (beta = 1 / lambda via slow.weight: null)
+#   - Gated residual predictor (c_0 = 0.1) with identity pred_proj (null)
+#   - Non-BatchNorm projector (GroupNorm1d by default; overrideable to torch.nn.LayerNorm)
+#
+# Usage:
+#   python train.py +experiment=slow_svreg data=ogb model=lewm
+#   python train.py +experiment=slow_svreg data=msdial model=convnext_ms loss.svreg.weight=30.0
+
+defaults:
+  - override /loss: slow_svreg
+
+model:
+  predictor:
+    gated_residual: true
+    gate_init: 0.1
+  pred_proj: null
+  projector:
+    norm_fn:
+      _target_: module.GroupNorm1d
+      _partial_: true

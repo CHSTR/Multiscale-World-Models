@@ -118,7 +118,10 @@ class JEPA(nn.Module):
         pred_emb = info_dict["predicted_emb"]  # (B,S, T-1, dim)
         goal_emb = info_dict["goal_emb"]  # (B, S, T, dim)
 
-        goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
+        if goal_emb.ndim == 3:
+            goal_emb = goal_emb[:, None, -1:].expand_as(pred_emb)
+        else:
+            goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
 
         # return last-step cost per action candidate
         cost = F.mse_loss(
@@ -142,11 +145,11 @@ class JEPA(nn.Module):
         goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
         goal["pixels"] = goal["goal"]
 
-        for k in info_dict:
-            if k.startswith("goal_"):
+        for k in list(info_dict.keys()):
+            if k.startswith("goal_") and k in goal:
                 goal[k[len("goal_") :]] = goal.pop(k)
 
-        goal.pop("action")
+        goal.pop("action", None)
         goal = self.encode(goal)
 
         info_dict["goal_emb"] = goal["emb"]

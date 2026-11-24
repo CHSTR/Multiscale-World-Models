@@ -32,6 +32,8 @@ predictor:
   dropout: 0.1
   use_velocity: true
   max_tokens: 4096
+  gated_residual: false
+  gate_init: 0.1
 
 action_encoder:
   _target_: module.Embedder
@@ -44,6 +46,9 @@ projector:
   input_dim: ${embed_dim}
   output_dim: ${embed_dim}
   hidden_dim: 1024
+  norm_fn:
+    _target_: torch.nn.LayerNorm
+    _partial_: true
 
 pred_proj:
   _target_: wavelet.factories.scale_mlp_dict
@@ -51,6 +56,9 @@ pred_proj:
   input_dim: ${embed_dim}
   output_dim: ${embed_dim}
   hidden_dim: 1024
+  norm_fn:
+    _target_: torch.nn.LayerNorm
+    _partial_: true
 
 inverse_dynamics: null
 scale_weights: null

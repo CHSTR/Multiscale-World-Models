@@ -13,10 +13,46 @@ from omegaconf import OmegaConf, open_dict
 
 from jepa_spatial import spatial_losses
 from jepa_pyramid import pyramid_losses
-from module import SIGReg, sigreg_input
+from module import SIGReg, SVReg, SlownessLoss, sigreg_input
 from prioritized_replay import (replay_collect, replay_weights, split_time, valid_windows,
                                 weighted_mean)
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback, StarletVisCallback
+
+
+def _pred_gate_logs(model):
+    pred = getattr(model, "predictor", None)
+    if pred is None:
+        return {}
+    gates = []
+    if hasattr(pred, "res_gate") and isinstance(pred.res_gate, torch.Tensor):
+        gates.append(pred.res_gate.detach().float())
+    if hasattr(pred, "predictors") and hasattr(pred.predictors, "values"):
+        for sub in pred.predictors.values():
+            if hasattr(sub, "res_gate") and isinstance(sub.res_gate, torch.Tensor):
+                gates.append(sub.res_gate.detach().float())
+    if not gates:
+        return {}
+    cat = torch.cat([g.reshape(-1) for g in gates])
+    return {
+        "pred_gate_mean": cat.mean(),
+        "pred_gate_absmax": cat.abs().max(),
+    }
+
+
+def _resolve_slow_beta(loss_type, slow_cfg, lambd, has_slow_mod):
+    slow_enabled = (
+        loss_type == "slow_svreg"
+        and bool(slow_cfg.get("enabled", True))
+        and has_slow_mod
+    )
+    if not slow_enabled:
+        return False, 0.0
+    slow_weight = slow_cfg.get("weight", None)
+    if slow_weight is not None:
+        return True, float(slow_weight)
+    if lambd > 0:
+        return True, 1.0 / lambd
+    return True, 0.0
 
 
 def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state", replay=None):
@@ -35,7 +71,19 @@ def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state", repl
 
     ctx_len = cfg.history_size
     n_preds = cfg.num_preds
-    lambd = cfg.loss.sigreg.weight
+    loss_type = str(cfg.loss.get("type", "sigreg")).lower()
+    if loss_type == "sigreg":
+        lambd = cfg.loss.sigreg.weight
+    elif loss_type in ("svreg", "slow_svreg"):
+        svreg_cfg = cfg.loss.get("svreg", None) or {}
+        lambd = float(svreg_cfg.get("weight", 30.0))
+        max_tokens = svreg_cfg.get("max_tokens", None)
+        slow_cfg = cfg.loss.get("slow", None) or {}
+        slow_enabled, beta = _resolve_slow_beta(
+            loss_type, slow_cfg, lambd, getattr(self, "slowness", None) is not None
+        )
+    else:
+        raise ValueError(f"Unknown cfg.loss.type={loss_type!r}; expected 'sigreg', 'svreg', or 'slow_svreg'")
 
     full_batch = None
     if replay is not None:
@@ -75,20 +123,48 @@ def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state", repl
         output["pred_loss"] = sum(
             w[l] * (pred_emb[l] - tgt_emb[l]).pow(2).mean() for l in emb
         )
-        if lambd > 0:
-            output["sigreg_loss"] = torch.stack([
-                self.sigreg(sigreg_input(emb[l], cfg.loss.sigreg.get("max_tokens", None)))
-                for l in emb
-            ]).mean()
+        if loss_type == "sigreg":
+            if lambd > 0:
+                output["sigreg_loss"] = torch.stack([
+                    self.sigreg(sigreg_input(emb[l], cfg.loss.sigreg.get("max_tokens", None)))
+                    for l in emb
+                ]).mean()
+            else:
+                output["sigreg_loss"] = next(iter(pred_emb.values())).new_zeros((), dtype=torch.float32)
+            output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
         else:
-            output["sigreg_loss"] = next(iter(pred_emb.values())).new_zeros((), dtype=torch.float32)
-        output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+            zero_scalar = next(iter(pred_emb.values())).new_zeros((), dtype=torch.float32)
+            if lambd > 0:
+                output["svreg_loss"] = torch.stack([
+                    self.svreg(sigreg_input(emb[l], max_tokens))
+                    for l in emb
+                ]).mean()
+            else:
+                output["svreg_loss"] = zero_scalar
+            if slow_enabled:
+                if beta != 0.0:
+                    output["slow_loss"] = torch.stack([
+                        self.slowness(emb[l]) for l in emb
+                    ]).mean()
+                else:
+                    with torch.no_grad():
+                        output["slow_loss"] = torch.stack([
+                            self.slowness(emb[l]) for l in emb
+                        ]).mean()
+            else:
+                output["slow_loss"] = zero_scalar.clone()
+            output["loss"] = (
+                output["pred_loss"]
+                + lambd * output["svreg_loss"]
+                + beta * output["slow_loss"]
+            )
         extra, extra_logs = pyramid_losses(
             self.model, batch, emb, pred_emb, tgt_emb, cfg, act_emb=act_emb
         )
         output["loss"] = output["loss"] + extra
         for l in emb:
             extra_logs[f"pred_loss_l{l}"] = (pred_emb[l] - tgt_emb[l]).pow(2).mean().detach()
+        extra_logs.update(_pred_gate_logs(self.model))
     else:
         ctx_emb = emb[:, :ctx_len]
         # label. Con el batch por defecto (T = history_size + num_preds) es igual a
@@ -108,15 +184,39 @@ def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state", repl
         else:
             per_sample = (pred_emb - tgt_emb).float().pow(2).mean(dim=(1, 2))   # (B,)
             output["pred_loss"] = weighted_mean(per_sample, w_pred)
-        if lambd > 0:
-            sig_in = sigreg_input(emb, cfg.loss.sigreg.get("max_tokens", None))
-            output["sigreg_loss"] = (self.sigreg(sig_in) if w_sig is None
-                                     else self.sigreg(sig_in, weights=w_sig))
+        if loss_type == "sigreg":
+            if lambd > 0:
+                sig_in = sigreg_input(emb, cfg.loss.sigreg.get("max_tokens", None))
+                output["sigreg_loss"] = (self.sigreg(sig_in) if w_sig is None
+                                         else self.sigreg(sig_in, weights=w_sig))
+            else:
+                # Sin parámetros entrenables antes de emb (encoder congelado y sin
+                # projector) SIGReg tiene gradiente cero: no se calcula.
+                output["sigreg_loss"] = pred_emb.new_zeros((), dtype=torch.float32)
+            output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
         else:
-            # Sin parámetros entrenables antes de emb (encoder congelado y sin
-            # projector) SIGReg tiene gradiente cero: no se calcula.
-            output["sigreg_loss"] = pred_emb.new_zeros((), dtype=torch.float32)
-        output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+            zero_scalar = pred_emb.new_zeros((), dtype=torch.float32)
+            if lambd > 0:
+                sig_in = sigreg_input(emb, max_tokens)
+                output["svreg_loss"] = (self.svreg(sig_in) if w_sig is None
+                                        else self.svreg(sig_in, weights=w_sig))
+            else:
+                output["svreg_loss"] = zero_scalar
+            if slow_enabled:
+                if beta != 0.0:
+                    output["slow_loss"] = (self.slowness(emb) if w_sig is None
+                                           else self.slowness(emb, weights=w_sig))
+                else:
+                    with torch.no_grad():
+                        output["slow_loss"] = (self.slowness(emb) if w_sig is None
+                                               else self.slowness(emb, weights=w_sig))
+            else:
+                output["slow_loss"] = zero_scalar.clone()
+            output["loss"] = (
+                output["pred_loss"]
+                + lambd * output["svreg_loss"]
+                + beta * output["slow_loss"]
+            )
 
         if replay is not None:
             # Etiquetas de K horizontes (sin gradiente) -> replay.last (lo lee el callback).
@@ -131,6 +231,7 @@ def lejepa_forward(self, batch, stage, cfg, pixels=None, state_col="state", repl
                 self.model, batch, emb, pred_emb, tgt_emb, cfg, act_emb=act_emb
             )
             output["loss"] = output["loss"] + extra
+        extra_logs.update(_pred_gate_logs(self.model))
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     losses_dict.update({f"{stage}/{k}": v for k, v in extra_logs.items()})
@@ -247,10 +348,25 @@ def run(cfg):
             cfg.img_size, stats["mean"], stats["std"],
         )
 
+    loss_type = str(cfg.loss.get("type", "sigreg")).lower()
+    sigreg_kwargs = (cfg.loss.get("sigreg", None) or {}).get("kwargs", {}) or {}
+    sigreg_mod = SIGReg(**sigreg_kwargs) if "sigreg" in cfg.loss else None
+    svreg_mod = None
+    slow_mod = None
+    if loss_type in ("svreg", "slow_svreg"):
+        svreg_kwargs = (cfg.loss.get("svreg", None) or {}).get("kwargs", {}) or {}
+        svreg_mod = SVReg(**svreg_kwargs)
+        slow_cfg = cfg.loss.get("slow", None) or {}
+        if loss_type == "slow_svreg" and slow_cfg.get("enabled", True):
+            slow_kwargs = slow_cfg.get("kwargs", {}) or {}
+            slow_mod = SlownessLoss(**slow_kwargs)
+
     data_module = spt.data.DataModule(train=train, val=val)
     world_model = spt.Module(
-        model = world_model,
-        sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
+        model=world_model,
+        sigreg=sigreg_mod,
+        svreg=svreg_mod,
+        slowness=slow_mod,
         forward=partial(lejepa_forward, cfg=cfg, pixels=pixels, state_col=state_col,
                         replay=replay_state),
         optim=optimizers,

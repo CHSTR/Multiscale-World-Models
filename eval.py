@@ -2,6 +2,7 @@ import os
 
 os.environ["MUJOCO_GL"] = "egl"
 
+import json
 import time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
+import swm_msdial  # noqa: F401  — register swm/MultiScaleDial-v0
 
 def img_transform(cfg):
     transform = transforms.Compose(
@@ -38,13 +40,41 @@ def get_episodes_length(dataset, episodes):
 
 
 def get_dataset(cfg, dataset_name):
-    dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
+    cache_dir = cfg.get("cache_dir", None) or os.environ.get("LOCAL_DATASET_DIR", None)
     dataset = swm.data.load_dataset(
         dataset_name,
-        cache_dir=dataset_path,
+        cache_dir=cache_dir,
         keys_to_cache=cfg.dataset.keys_to_cache,
     )
     return dataset
+
+
+def resolve_policy_arg(policy_name: str) -> str:
+    p = Path(policy_name).expanduser()
+    return str(p.resolve()) if p.exists() else policy_name
+
+
+def resolve_results_path(cfg: DictConfig) -> Path:
+    out_cfg = cfg.get("output", None)
+    if out_cfg and out_cfg.get("dir", None):
+        return Path(out_cfg.dir)
+    policy_name = cfg.get("policy", "random")
+    if policy_name != "random":
+        p = Path(policy_name).expanduser()
+        if p.exists():
+            p = p.resolve()
+        else:
+            ckpt_root = swm.data.utils.get_cache_dir(
+                cfg.get("cache_dir", None), sub_folder="checkpoints"
+            )
+            p = Path(ckpt_root, policy_name)
+        return p if p.is_dir() else p.parent
+    return Path(__file__).parent
+
+
+def instantiate_solver(cfg: DictConfig, model):
+    solver_kwargs = {"cost": model} if "cost" in cfg.solver.keys() else {"model": model}
+    return hydra.utils.instantiate(cfg.solver, **solver_kwargs)
 
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
@@ -82,16 +112,20 @@ def run(cfg: DictConfig):
             process[f"goal_{col}"] = process[col]
 
     # -- run evaluation
-    policy = cfg.get("policy", "random")
+    policy_name = cfg.get("policy", "random")
 
-    if policy != "random":
-        model = swm.wm.utils.load_pretrained(cfg.policy)
-        model = model.to("cuda")
+    if policy_name != "random":
+        ckpt_arg = resolve_policy_arg(policy_name)
+        model = swm.wm.utils.load_pretrained(
+            ckpt_arg, cache_dir=cfg.get("cache_dir", None)
+        )
+        device = cfg.solver.get("device", "cuda")
+        model = model.to(device)
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
         config = swm.PlanConfig(**cfg.plan_config)
-        solver = hydra.utils.instantiate(cfg.solver, model=model)
+        solver = instantiate_solver(cfg, model)
         policy = swm.policy.WorldModelPolicy(
             solver=solver, config=config, process=process, transform=transform
         )
@@ -99,11 +133,7 @@ def run(cfg: DictConfig):
     else:
         policy = swm.policy.RandomPolicy()
 
-    results_path = (
-        Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
-        if cfg.policy != "random"
-        else Path(__file__).parent
-    )
+    results_path = resolve_results_path(cfg)
 
     # sample the episodes and the starting indices
     episode_len = get_episodes_length(dataset, ep_indices)
@@ -120,9 +150,12 @@ def run(cfg: DictConfig):
     valid_indices = np.nonzero(valid_mask)[0]
     print(valid_mask.sum(), "valid starting points found for evaluation.")
 
+    if len(valid_indices) < cfg.eval.num_eval:
+        raise ValueError("Not enough episodes with sufficient length for evaluation.")
+
     g = np.random.default_rng(cfg.seed)
     random_episode_indices = g.choice(
-        len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
+        len(valid_indices), size=cfg.eval.num_eval, replace=False
     )
 
     # sort increasingly to avoid issues with HDF5Dataset indexing
@@ -153,6 +186,29 @@ def run(cfg: DictConfig):
     end_time = time.time()
     
     print(metrics)
+
+    # JSONL por episodio: insumo de swm_msdial/paired_stats.py (McNemar/Holm).
+    jsonl_path = results_path / "results.jsonl"
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "policy": str(cfg.policy),
+        "dataset": str(cfg.eval.dataset_name),
+        "env_name": str(cfg.world.env_name),
+        "seed": int(cfg.seed),
+        "goal_offset_steps": int(cfg.eval.goal_offset_steps),
+        "eval_budget": int(cfg.eval.eval_budget),
+        "success_rate": float(metrics["success_rate"]),
+        "successes": [bool(x) for x in metrics["episode_successes"]],
+        "episodes": [int(x) for x in eval_episodes],
+        "start_steps": [int(x) for x in eval_start_idx],
+    }
+    n_envs = world.num_envs
+    for key, out_key in (("ever_pos", "success_pos"), ("ever_dial", "success_dial")):
+        if key in world.infos:
+            arr = np.asarray(world.infos[key]).reshape(-1)[:n_envs].astype(bool)
+            record[out_key] = [bool(x) for x in arr]
+    with jsonl_path.open("a") as f:
+        f.write(json.dumps(record) + "\n")
 
     results_path = results_path / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)

@@ -43,6 +43,21 @@ GROUP_SPECS: dict[str, list[str]] = {
     "block_yaw": ["privileged_block_0_yaw"],
 }
 
+EXTRA_DIAG_SPECS: dict[str, list[str]] = {
+    "gripper_contact": ["proprio_gripper_contact"],
+}
+
+
+def group_targets_for_specs(
+    targets_by_col: dict[str, np.ndarray],
+    specs: dict[str, list[str]],
+) -> dict[str, np.ndarray]:
+    """Concatena las columnas de cada grupo en `specs` respetando sus dimensiones."""
+    return {
+        group: np.concatenate([targets_by_col[c] for c in cols], axis=1)
+        for group, cols in specs.items()
+    }
+
 
 def all_target_columns() -> list[str]:
     cols: list[str] = []
@@ -96,10 +111,7 @@ def sample_and_split(dataset, n_frames: int, val_frac: float = 0.2, seed: int = 
 
 def group_targets(targets_by_col: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Concatena las columnas de cada grupo respetando sus dimensiones reales."""
-    return {
-        group: np.concatenate([targets_by_col[c] for c in cols], axis=1)
-        for group, cols in GROUP_SPECS.items()
-    }
+    return group_targets_for_specs(targets_by_col, GROUP_SPECS)
 
 
 def drop_nan_rows(targets: dict[str, np.ndarray]) -> np.ndarray:
@@ -187,18 +199,42 @@ def extract_features(
 
     for batch in loader:
         pixels = batch["pixels"].float()
-        pixels = pixels.reshape(-1, *pixels.shape[-3:]).to(device)
-        out = _encoder_forward(model.encoder, pixels)
-        tokens = getattr(out, "last_hidden_state", out)
-        if isinstance(tokens, (tuple, list)):
-            tokens = tokens[0]
-
-        if source == "cls":
-            f = tokens[:, 0]
-        elif source in ("patch_mean", "patchmean"):
-            f = tokens[:, -_n_patches(model, tokens.size(1)) :].mean(dim=1)
+        pixels_4d = pixels.reshape(-1, *pixels.shape[-3:]).to(device)
+        if source == "emb":
+            emb = model.encode({"pixels": pixels_4d.unsqueeze(1)})["emb"]
+            if isinstance(emb, dict):
+                f = torch.cat(
+                    [
+                        (
+                            v.mean(dim=2)[:, 0]
+                            if v.ndim == 4
+                            else (v[:, 0] if v.ndim == 3 else v)
+                        )
+                        for v in (emb[k] for k in sorted(emb.keys()))
+                    ],
+                    dim=-1,
+                )
+            else:
+                if emb.ndim == 4:
+                    emb = emb.mean(dim=2)
+                f = emb[:, 0] if emb.ndim == 3 else emb
         else:
-            raise ValueError(f"source {source!r} no soportado (cls|patch_mean)")
+            out = _encoder_forward(model.encoder, pixels_4d)
+            tokens = getattr(out, "last_hidden_state", out)
+            if isinstance(tokens, (tuple, list)):
+                tokens = tokens[0]
+            if not torch.is_tensor(tokens):
+                raise ValueError(
+                    f"source={source!r} requires an encoder with last_hidden_state; "
+                    f"use --source emb for {type(model).__name__} ({type(out).__name__})."
+                )
+
+            if source == "cls":
+                f = tokens[:, 0]
+            elif source in ("patch_mean", "patchmean"):
+                f = tokens[:, -_n_patches(model, tokens.size(1)) :].mean(dim=1)
+            else:
+                raise ValueError(f"source {source!r} no soportado (cls|patch_mean|emb)")
 
         feats.append(f.float().cpu().numpy())
         for c in cols:
@@ -406,7 +442,12 @@ def make_rows(
 
         sq = np.mean((yt - yp) ** 2, axis=0)
         mse_raw = float(np.mean(sq))
-        mse_z = mse_raw if var is None else float(np.mean(sq / np.asarray(var)))
+        if var is None:
+            mse_z = mse_raw
+        else:
+            v_arr = np.asarray(var, dtype=np.float64)
+            v_arr = np.where(v_arr < 1e-12, 1.0, v_arr)
+            mse_z = float(np.mean(sq / v_arr))
         _, r = mse_and_pearson(yt, yp)
 
         rows.append(
@@ -440,14 +481,42 @@ def _load_or_extract(
     seed: int, sources: list[str], force: bool,
 ):
     cache = _cache_path(out_dir, ckpt, n_frames, seed)
+    cols = all_target_columns()
     if cache.exists() and not force:
-        data = np.load(cache)
-        tr = data["train_idx"]
-        va = data["val_idx"]
-        feats = {s: (data[f"{s}_train"], data[f"{s}_val"]) for s in sources if f"{s}_train" in data}
-        cols = all_target_columns()
-        tgt_tr = {c: data[f"tgt_train_{c}"] for c in cols}
-        tgt_va = {c: data[f"tgt_val_{c}"] for c in cols}
+        with np.load(cache) as data:
+            tr = data["train_idx"]
+            va = data["val_idx"]
+            cached_sources = {
+                k[:-6]
+                for k in data.files
+                if k.endswith("_train") and f"{k[:-6]}_val" in data.files
+            }
+            all_cached = {
+                s: (data[f"{s}_train"], data[f"{s}_val"])
+                for s in cached_sources
+            }
+            tgt_tr = {c: data[f"tgt_train_{c}"] for c in cols}
+            tgt_va = {c: data[f"tgt_val_{c}"] for c in cols}
+
+        missing = [s for s in sources if s not in all_cached]
+        if missing:
+            tr_list = tr.tolist()
+            va_list = va.tolist()
+            for s in missing:
+                a = extract_features(model, dataset, tr_list, source=s)
+                b = extract_features(model, dataset, va_list, source=s)
+                all_cached[s] = (a["features"], b["features"])
+            np.savez_compressed(
+                cache,
+                train_idx=np.asarray(tr),
+                val_idx=np.asarray(va),
+                **{f"{s}_train": pair[0] for s, pair in all_cached.items()},
+                **{f"{s}_val": pair[1] for s, pair in all_cached.items()},
+                **{f"tgt_train_{c}": tgt_tr[c] for c in tgt_tr},
+                **{f"tgt_val_{c}": tgt_va[c] for c in tgt_va},
+            )
+            print(f"[probe] cache actualizado ({missing}) -> {cache}")
+        feats = {s: all_cached[s] for s in sources}
         return tr, va, feats, tgt_tr, tgt_va
 
     tr, va = sample_and_split(dataset, n_frames, val_frac, seed)
@@ -472,6 +541,34 @@ def _load_or_extract(
     return tr, va, feats, tgt_tr, tgt_va
 
 
+def evaluate_group_probes(
+    ckpt: str,
+    source: str,
+    Xtr: np.ndarray,
+    Xva: np.ndarray,
+    Ytr_s: dict[str, np.ndarray],
+    Yva_s: dict[str, np.ndarray],
+    specs: dict[str, list[str]],
+    var: dict[str, np.ndarray],
+    seed: int = 0,
+) -> list[dict]:
+    _, Zva, _ = standardize(Xtr, Xva)
+    rows: list[dict] = []
+
+    pred_va: dict[str, np.ndarray] = {}
+    for group in specs:
+        W, b, _ = fit_ridge(Xtr, Ytr_s[group], Xva, Yva_s[group])
+        pred_va[group] = Zva @ W + b
+    rows += make_rows(ckpt, source, "ridge", Yva_s, pred_va, specs, var)
+
+    pred_va = {}
+    for group in specs:
+        m = fit_mlp(Xtr, Ytr_s[group], Xva, Yva_s[group], seed=seed)
+        pred_va[group] = predict_mlp(m, Xva)
+    rows += make_rows(ckpt, source, "mlp", Yva_s, pred_va, specs, var)
+    return rows
+
+
 def run_probe(
     ckpt: str,
     sources: list[str],
@@ -488,22 +585,26 @@ def run_probe(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # load_pretrained resuelve relativos contra el cache: usar ruta absoluta.
-    ckpt = str(Path(ckpt).expanduser().resolve())
+    p = Path(ckpt).expanduser()
+    ckpt_arg = str(p.resolve()) if p.exists() else ckpt
 
-    print(f"[probe] cargando {ckpt}")
-    model = swm.wm.utils.load_pretrained(ckpt)
+    print(f"[probe] cargando {ckpt_arg}")
+    model = swm.wm.utils.load_pretrained(ckpt_arg, cache_dir=cache_dir)
     model = model.eval().requires_grad_(False)
     model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = load_cube_dataset(cache_dir=cache_dir)
     _, _, feats, tgt_tr, tgt_va = _load_or_extract(
-        model, dataset, ckpt, out_dir, n_frames, val_frac, seed, sources, force
+        model, dataset, ckpt_arg, out_dir, n_frames, val_frac, seed, sources, force
     )
 
     Ytr = group_targets(tgt_tr)
     Yva = group_targets(tgt_va)
     var = {g: Ytr[g].var(axis=0) for g in GROUP_SPECS}
+
+    Ytr_extra = group_targets_for_specs(tgt_tr, EXTRA_DIAG_SPECS)
+    Yva_extra = group_targets_for_specs(tgt_va, EXTRA_DIAG_SPECS)
+    var_extra = {g: Ytr_extra[g].var(axis=0) for g in EXTRA_DIAG_SPECS}
 
     rows: list[dict] = []
     for s in sources:
@@ -515,25 +616,21 @@ def run_probe(
         Ytr_s = {g: v[ok_tr] for g, v in Ytr.items()}
         Yva_s = {g: v[ok_va] for g, v in Yva.items()}
 
-        Ztr, Zva, _ = standardize(Xtr, Xva)
-
-        pred_va: dict[str, np.ndarray] = {}
-        for group in GROUP_SPECS:
-            W, b, _ = fit_ridge(Xtr, Ytr_s[group], Xva, Yva_s[group])
-            pred_va[group] = Zva @ W + b
-        rows += make_rows(ckpt, s, "ridge", Yva_s, pred_va, GROUP_SPECS, var)
-
-        pred_va = {}
-        for group in GROUP_SPECS:
-            m = fit_mlp(Xtr, Ytr_s[group], Xva, Yva_s[group], seed=seed)
-            pred_va[group] = predict_mlp(m, Xva)
-        rows += make_rows(ckpt, s, "mlp", Yva_s, pred_va, GROUP_SPECS, var)
+        rows += evaluate_group_probes(
+            ckpt_arg, s, Xtr, Xva, Ytr_s, Yva_s, GROUP_SPECS, var, seed=seed
+        )
+        if EXTRA_DIAG_SPECS:
+            Ytr_ex_s = {g: v[ok_tr] for g, v in Ytr_extra.items()}
+            Yva_ex_s = {g: v[ok_va] for g, v in Yva_extra.items()}
+            rows += evaluate_group_probes(
+                ckpt_arg, s, Xtr, Xva, Ytr_ex_s, Yva_ex_s, EXTRA_DIAG_SPECS, var_extra, seed=seed
+            )
 
         print(f"[probe] {s}: ridge+mlp listos ({len(rows)} filas acumuladas)")
 
     import pandas as pd
 
-    stem = Path(ckpt).parent.name + "__" + Path(ckpt).stem
+    stem = Path(ckpt_arg).parent.name + "__" + Path(ckpt_arg).stem
     csv_path = out_dir / f"{stem}_{'-'.join(sources)}.csv"
     pd.DataFrame(rows).to_csv(csv_path, index=False)
     print(f"[probe] resultados -> {csv_path}")
@@ -543,7 +640,7 @@ def run_probe(
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Probes lineales/MLP sobre latentes de Cube")
     p.add_argument("--ckpt", action="append", required=True, help="checkpoint (repetible)")
-    p.add_argument("--source", action="append", choices=["cls", "patch_mean"], default=None)
+    p.add_argument("--source", action="append", choices=["cls", "patch_mean", "emb"], default=None)
     p.add_argument("--n-frames", type=int, default=50_000)
     p.add_argument("--val-frac", type=float, default=0.2)
     p.add_argument("--out-dir", default="outputs/probe")

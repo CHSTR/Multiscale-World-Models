@@ -9,7 +9,7 @@ world:
   max_episode_steps: ??? # make sure it's >= eval_budget
 
 seed: 42
-policy: /home/chr/le-wm/dataset/checkpoints/lewm/weights_epoch_10.pt #random # ckpt name or random
+policy: random # ckpt name or random
 
 dataset:
   stats: ${eval.dataset_name}

@@ -43,10 +43,10 @@ def get_episodes_length(dataset, episodes):
 
 
 def get_dataset(cfg, dataset_name):
-    dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
+    cache_dir = cfg.get("cache_dir", None) or os.environ.get("LOCAL_DATASET_DIR", None)
     dataset = swm.data.load_dataset(
         dataset_name,
-        cache_dir=dataset_path,
+        cache_dir=cache_dir,
         keys_to_cache=cfg.dataset.keys_to_cache,
     )
     return dataset
@@ -87,16 +87,22 @@ def run(cfg: DictConfig):
             process[f"goal_{col}"] = process[col]
 
     # -- run evaluation
-    policy = cfg.get("policy", "random")
+    policy_name = cfg.get("policy", "random")
 
-    if policy != "random":
-        model = swm.wm.utils.load_pretrained(cfg.policy)
-        model = model.to("cuda")
+    if policy_name != "random":
+        p = Path(policy_name).expanduser()
+        ckpt_arg = str(p.resolve()) if p.exists() else policy_name
+        model = swm.wm.utils.load_pretrained(
+            ckpt_arg, cache_dir=cfg.get("cache_dir", None)
+        )
+        device = cfg.solver.get("device", "cuda")
+        model = model.to(device)
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
         config = swm.PlanConfig(**cfg.plan_config)
-        solver = hydra.utils.instantiate(cfg.solver, model=model)
+        solver_kwargs = {"cost": model} if "cost" in cfg.solver.keys() else {"model": model}
+        solver = hydra.utils.instantiate(cfg.solver, **solver_kwargs)
         policy = swm.policy.WorldModelPolicy(
             solver=solver, config=config, process=process, transform=transform
         )
@@ -104,11 +110,21 @@ def run(cfg: DictConfig):
     else:
         policy = swm.policy.RandomPolicy()
 
-    results_path = (
-        Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
-        if cfg.policy != "random"
-        else Path(__file__).parent
-    )
+    out_cfg = cfg.get("output", None)
+    if out_cfg and out_cfg.get("dir", None):
+        results_path = Path(out_cfg.dir)
+    elif policy_name != "random":
+        p = Path(policy_name).expanduser()
+        if p.exists():
+            p = p.resolve()
+        else:
+            ckpt_root = swm.data.utils.get_cache_dir(
+                cfg.get("cache_dir", None), sub_folder="checkpoints"
+            )
+            p = Path(ckpt_root, policy_name)
+        results_path = p if p.is_dir() else p.parent
+    else:
+        results_path = Path(__file__).parent
 
     # sample the episodes and the starting indices
     episode_len = get_episodes_length(dataset, ep_indices)
@@ -127,7 +143,7 @@ def run(cfg: DictConfig):
 
     g = np.random.default_rng(cfg.seed)
     random_episode_indices = g.choice(
-        len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
+        len(valid_indices), size=cfg.eval.num_eval, replace=False
     )
 
     # sort increasingly to avoid issues with HDF5Dataset indexing

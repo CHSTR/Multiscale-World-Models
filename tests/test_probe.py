@@ -1,3 +1,4 @@
+import functools
 import types
 
 import numpy as np
@@ -5,18 +6,29 @@ import pytest
 import torch
 from torch import nn
 
+from jepa import JEPA
+from jepa_pyramid import PyramidJEPA
+from module import ARPredictor, Embedder, GroupNorm1d, MLP
 from probe_train import (
+    EXTRA_DIAG_SPECS,
     GROUP_SPECS,
+    _load_or_extract,
+    all_target_columns,
     drop_nan_rows,
+    evaluate_group_probes,
     extract_features,
     fit_mlp,
     fit_ridge,
+    group_targets_for_specs,
     make_rows,
     mse_and_pearson,
+    parse_args,
     predict_mlp,
     sample_and_split,
     standardize,
 )
+from wavelet.factories import hier_vit, scale_mlp_dict
+from wavelet.pyramid_encoder import PyramidOutput, ScaleTokens
 
 
 class FakeDataset:
@@ -181,3 +193,167 @@ def test_rows_have_expected_columns_and_group_dim():
     assert rows[0]["dim"] == 3
     assert rows[0]["pearson"] == pytest.approx(1.0)
     assert rows[0]["mse_z"] == pytest.approx(0.0)
+
+
+class _StubPyramidEncoder(nn.Module):
+    def __init__(self, dim: int = 8):
+        super().__init__()
+        self.levels = 1  # 2 scales: 0, 1
+        self.dim = dim
+
+    def forward(self, x, **_kw):
+        b = x.size(0)
+        s0 = ScaleTokens(
+            tokens=torch.full((b, 4, self.dim), 1.0, device=x.device),
+            grid_hw=(2, 2),
+            level=0,
+        )
+        s1 = ScaleTokens(
+            tokens=torch.full((b, 16, self.dim), 2.0, device=x.device),
+            grid_hw=(4, 4),
+            level=1,
+        )
+        return PyramidOutput(scales=[s0, s1])
+
+
+def _make_jepa_slow_svreg(dim: int = 8) -> JEPA:
+    enc = StubEncoder(n_patches=4)
+    # StubEncoder outputs dim=3; wrap projector to map 3 -> dim
+    proj = MLP(3, 16, output_dim=dim, norm_fn=functools.partial(GroupNorm1d, num_groups=2))
+    pred = ARPredictor(
+        num_frames=3,
+        input_dim=dim,
+        hidden_dim=dim,
+        output_dim=dim,
+        depth=1,
+        heads=2,
+        mlp_dim=16,
+        dim_head=4,
+        gated_residual=True,
+        gate_init=0.1,
+    )
+    act_enc = Embedder(input_dim=2, emb_dim=dim)
+    return JEPA(enc, pred, act_enc, projector=proj, pred_proj=None)
+
+
+def _make_pyramid_slow_svreg(dim: int = 8) -> PyramidJEPA:
+    enc = _StubPyramidEncoder(dim=dim)
+    proj = scale_mlp_dict(
+        2,
+        dim,
+        dim,
+        hidden_dim=16,
+        norm_fn=functools.partial(GroupNorm1d, num_groups=2),
+    )
+    pred = hier_vit(
+        n_scales=2,
+        latent_dim=dim,
+        act_dim=dim,
+        depth=1,
+        heads=2,
+        dim_head=4,
+        mlp_dim=16,
+        gated_residual=True,
+        gate_init=0.1,
+    )
+    act_enc = Embedder(input_dim=2, emb_dim=dim)
+    return PyramidJEPA(enc, pred, act_enc, projector=proj, pred_proj=None)
+
+
+def test_extract_features_emb_jepa_and_pyramid():
+    ds = TinyDataset(n=4)
+    jepa = _make_jepa_slow_svreg(dim=8)
+    out_jepa = extract_features(
+        jepa, ds, [0, 1, 2, 3], source="emb", batch_size=2, target_columns=["proprio_joint_pos"]
+    )
+    assert out_jepa["features"].shape == (4, 8)
+    assert np.isfinite(out_jepa["features"]).all()
+
+    pyr = _make_pyramid_slow_svreg(dim=8)
+    out_pyr = extract_features(
+        pyr, ds, [0, 1, 2, 3], source="emb", batch_size=2, target_columns=["proprio_joint_pos"]
+    )
+    # 2 scales concatenated: 8 + 8 = 16
+    assert out_pyr["features"].shape == (4, 16)
+    assert np.isfinite(out_pyr["features"]).all()
+
+
+def test_extract_features_cls_on_pyramid_raises_clear_error():
+    ds = TinyDataset(n=2)
+    pyr = _make_pyramid_slow_svreg(dim=8)
+    with pytest.raises(ValueError, match="--source emb"):
+        extract_features(
+            pyr, ds, [0, 1], source="cls", batch_size=2, target_columns=["proprio_joint_pos"]
+        )
+
+
+class _MultiColTinyDataset:
+    def __init__(self, n=12):
+        self.n = n
+        self.ep_idx = np.repeat(np.arange(4), 3)
+        self.cols = all_target_columns()
+
+    def __len__(self):
+        return self.n
+
+    def get_col_data(self, name):
+        assert name == "ep_idx"
+        return self.ep_idx
+
+    def __getitem__(self, i):
+        item = {"pixels": torch.zeros(1, 3, 224, 224)}
+        for c in self.cols:
+            dim = 4 if "quat" in c else (3 if "pos" in c else 1)
+            item[c] = torch.full((1, dim), float(i % 5) + 0.1)
+        return item
+
+
+def test_load_or_extract_incremental_cache_merge(tmp_path):
+    ds = _MultiColTinyDataset(n=12)
+    model = _make_jepa_slow_svreg(dim=8)
+    ckpt = str(tmp_path / "run_a" / "weights_epoch_1.pt")
+
+    tr1, va1, feats1, _, _ = _load_or_extract(
+        model, ds, ckpt, tmp_path, n_frames=12, val_frac=0.25, seed=0, sources=["cls"], force=False
+    )
+    assert "cls" in feats1 and feats1["cls"][0].shape[1] == 3
+
+    tr2, va2, feats2, _, _ = _load_or_extract(
+        model, ds, ckpt, tmp_path, n_frames=12, val_frac=0.25, seed=0, sources=["emb"], force=False
+    )
+    assert np.array_equal(tr1, tr2)
+    assert np.array_equal(va1, va2)
+    assert "emb" in feats2 and feats2["emb"][0].shape[1] == 8
+
+    # Both sources now available from cache without re-extraction
+    _, _, feats3, _, _ = _load_or_extract(
+        model, ds, ckpt, tmp_path, n_frames=12, val_frac=0.25, seed=0, sources=["cls", "emb"], force=False
+    )
+    assert np.allclose(feats3["cls"][0], feats1["cls"][0])
+    assert np.allclose(feats3["emb"][0], feats2["emb"][0])
+
+
+def test_extra_diag_specs_contact_preserves_eight_groups():
+    assert len(GROUP_SPECS) == 8
+    assert EXTRA_DIAG_SPECS == {"gripper_contact": ["proprio_gripper_contact"]}
+
+    rng = np.random.default_rng(7)
+    Xtr = rng.normal(size=(80, 8)).astype(np.float32)
+    Xva = rng.normal(size=(30, 8)).astype(np.float32)
+    contact_tr = (Xtr[:, :1] > 0).astype(np.float32)
+    contact_va = (Xva[:, :1] > 0).astype(np.float32)
+    Ytr_ex = group_targets_for_specs({"proprio_gripper_contact": contact_tr}, EXTRA_DIAG_SPECS)
+    Yva_ex = group_targets_for_specs({"proprio_gripper_contact": contact_va}, EXTRA_DIAG_SPECS)
+    var_ex = {g: Ytr_ex[g].var(axis=0) for g in EXTRA_DIAG_SPECS}
+
+    rows = evaluate_group_probes(
+        "run/weights_epoch_1.pt", "emb", Xtr, Xva, Ytr_ex, Yva_ex, EXTRA_DIAG_SPECS, var_ex, seed=0
+    )
+    assert {r["group"] for r in rows} == {"gripper_contact"}
+    assert {r["probe"] for r in rows} == {"ridge", "mlp"}
+    assert all(r["dim"] == 1 and np.isfinite(r["pearson"]) for r in rows)
+
+
+def test_parse_args_accepts_emb():
+    args = parse_args(["--ckpt", "foo.pt", "--source", "emb"])
+    assert args.source == ["emb"]
